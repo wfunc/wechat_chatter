@@ -188,40 +188,7 @@ var videoIdAddr = ptr(0);
 var videoPathAddr1 = ptr(0)
 
 
-// -------------------------上传队列 (解决并发问题)-------------------------
-// 图片上传完成队列 - 存储 {cdnKey, aesKey, md5Key, targetId}
-var imageUploadQueue = [];
-// 视频上传完成队列 - 存储 {cdnKey, aesKey, md5Key, videoIdentity, targetId}
-var videoUploadQueue = [];
 
-// 从队列中获取最早的可用上传信息
-function getImageUploadInfo() {
-    if (imageUploadQueue.length > 0) {
-        return imageUploadQueue.shift();
-    }
-    return null;
-}
-
-function getVideoUploadInfo() {
-    if (videoUploadQueue.length > 0) {
-        return videoUploadQueue.shift();
-    }
-    return null;
-}
-
-function pushImageUploadInfo(info) {
-    imageUploadQueue.push(info);
-}
-
-function pushVideoUploadInfo(info) {
-    videoUploadQueue.push(info);
-}
-
-// -------------------------上传队列 end-------------------------
-
-// 文本消息发送队列
-var textMessageQueue = [];
-var isSendingText = false;
 
 // 发送消息的全局变量
 var taskIdGlobal = 0x20000090 // 最好比较大，不和原始的微信消息重复
@@ -230,6 +197,15 @@ var contentGlobal = "";
 var senderGlobal = "wxid_"
 var lastSendTime = 0;
 var atUserGlobal = "";
+
+// 图片/视频发送cdn信息全局变量 (从Go直接传入)
+var imgCdnKeyGlobal = "";
+var imgAesKeyGlobal = "";
+var imgMd5KeyGlobal = "";
+var videoCdnKeyGlobal = "";
+var videoAesKeyGlobal = "";
+var videoMd5KeyGlobal = "";
+var videoIdGlobal = "";
 
 const fileCp = generateBytes(16)
 
@@ -339,31 +315,13 @@ function triggerSendTextMessage(taskId, receiver, content, atUser) {
         return "fail";
     }
 
-    // 入队，由队列调度发送
-    textMessageQueue.push({taskId: taskId, receiver: receiver, content: content, atUser: atUser});
-    if (!isSendingText) {
-        processNextTextMessage();
-    }
-
-    return "1";
-}
-
-function processNextTextMessage() {
-    if (textMessageQueue.length === 0) {
-        isSendingText = false;
-        return;
-    }
-
-    isSendingText = true;
-    var msg = textMessageQueue.shift();
-
     // 获取当前时间戳 (秒)
     const timestamp = Math.floor(Date.now() / 1000);
     lastSendTime = timestamp
-    taskIdGlobal = msg.taskId;
-    receiverGlobal = msg.receiver;
-    contentGlobal = msg.content;
-    atUserGlobal = msg.atUser
+    taskIdGlobal = taskId;
+    receiverGlobal = receiver;
+    contentGlobal = content;
+    atUserGlobal = atUser
     console.log("triggerSendTextMessage: receiver=" + receiverGlobal);
 
     textMessageAddr.add(0x08).writeU32(taskIdGlobal);
@@ -435,7 +393,8 @@ function processNextTextMessage() {
 
     // 5. 调用函数
     try {
-        return MMStartTask(triggerX0, triggerX1Payload);
+        MMStartTask(triggerX0, triggerX1Payload);
+        return "1";
     } catch (e) {
         console.error(`[!] Error trigger  MMStartTask ${sendFuncAddr} with args: (${triggerX0}) (${triggerX1Payload}),   during execution: ` + e);
         return "fail";
@@ -568,10 +527,6 @@ function attachReq2buf() {
             send({
                 type: "finish",
             })
-
-            // 处理文本消息队列中的下一条
-            isSendingText = false;
-            processNextTextMessage();
         }
     });
 }
@@ -754,7 +709,7 @@ function patchVideoProtoBuf() {
 
 setImmediate(patchVideoProtoBuf);
 
-function triggerSendImgMessage(taskId, sender, receiver) {
+function triggerSendImgMessage(taskId, sender, receiver, cdnKey, aesKey, md5Key) {
     if (!taskId || !receiver || !sender) {
         console.error("[!] taskId or receiver or sender is empty!");
         return "fail";
@@ -764,6 +719,11 @@ function triggerSendImgMessage(taskId, sender, receiver) {
         console.error("[!] triggerX0 或 triggerX1Payload 尚未初始化，请等待 hook 捕获");
         return "fail";
     }
+
+    // 保存cdn信息供attachProto使用
+    imgCdnKeyGlobal = cdnKey;
+    imgAesKeyGlobal = aesKey;
+    imgMd5KeyGlobal = md5Key;
 
     // 获取当前时间戳 (秒)
     const timestamp = Math.floor(Date.now() / 1000);
@@ -840,14 +800,15 @@ function triggerSendImgMessage(taskId, sender, receiver) {
 
     // 5. 调用函数
     try {
-        return MMStartTask(triggerX0, triggerX1Payload);
+        MMStartTask(triggerX0, triggerX1Payload);
+        return "1";
     } catch (e) {
         console.error(`[!] Error trigger StartTask ${sendFuncAddr} with args: (${triggerX0}) (${triggerX1Payload}),   during execution: ` + e);
         return "fail";
     }
 }
 
-function triggerSendVideoMessage(taskId, sender, receiver) {
+function triggerSendVideoMessage(taskId, sender, receiver, cdnKey, aesKey, md5Key, videoId) {
     if (!taskId || !receiver || !sender) {
         console.error("[!] taskId or receiver or sender is empty!");
         return "fail";
@@ -857,6 +818,12 @@ function triggerSendVideoMessage(taskId, sender, receiver) {
         console.error("[!] triggerX0 或 triggerX1Payload 尚未初始化，请等待 hook 捕获");
         return "fail";
     }
+
+    // 保存cdn信息供attachProto使用
+    videoCdnKeyGlobal = cdnKey;
+    videoAesKeyGlobal = aesKey;
+    videoMd5KeyGlobal = md5Key;
+    videoIdGlobal = videoId;
 
     // 获取当前时间戳 (秒)
     const timestamp = Math.floor(Date.now() / 1000);
@@ -933,7 +900,8 @@ function triggerSendVideoMessage(taskId, sender, receiver) {
 
     // 5. 调用函数
     try {
-        return MMStartTask(triggerX0, triggerX1Payload);
+        MMStartTask(triggerX0, triggerX1Payload);
+        return "1";
     } catch (e) {
         console.error(`[!] Error trigger StartTask ${sendFuncAddr} with args: (${triggerX0}) (${triggerX1Payload}),   during execution: ` + e);
         return "fail";
@@ -951,19 +919,13 @@ function attachProto() {
                 return;
             }
 
-            // 从图片队列获取上传信息
-            const imgUploadInfo = getImageUploadInfo();
-            let cdnKey = "";
-            let aesKey = "";
-            let md5Key = "";
-            let targetId = "";
+            // 使用从Go传入的全局cdn信息
+            let cdnKey = imgCdnKeyGlobal;
+            let aesKey = imgAesKeyGlobal;
+            let md5Key = imgMd5KeyGlobal;
+            let targetId = receiverGlobal;
 
-            if (imgUploadInfo) {
-                cdnKey = imgUploadInfo.cdnKey;
-                aesKey = imgUploadInfo.aesKey;
-                md5Key = imgUploadInfo.md5Key;
-                targetId = imgUploadInfo.targetId
-            } else {
+            if (!cdnKey || !aesKey || !md5Key) {
                 console.error("[!] 无法获取图片上传信息")
                 return
             }
@@ -1066,21 +1028,14 @@ function attachProto() {
                 return;
             }
 
-            // 从视频队列获取上传信息
-            const videoUploadInfo = getVideoUploadInfo();
-            let cdnKey = "";
-            let aesKey = "";
-            let md5Key = "";
-            let videoId = "";
-            let targetId = "";
+            // 使用从Go传入的全局cdn信息
+            let cdnKey = videoCdnKeyGlobal;
+            let aesKey = videoAesKeyGlobal;
+            let md5Key = videoMd5KeyGlobal;
+            let videoId = videoIdGlobal;
+            let targetId = receiverGlobal;
 
-            if (videoUploadInfo) {
-                cdnKey = videoUploadInfo.cdnKey;
-                aesKey = videoUploadInfo.aesKey;
-                md5Key = videoUploadInfo.md5Key;
-                videoId = videoUploadInfo.videoIdentity;
-                targetId = videoUploadInfo.targetId;
-            } else {
+            if (!cdnKey || !aesKey || !md5Key) {
                 console.error("[!] 无法获取视频上传信息");
                 return;
             }
@@ -1473,28 +1428,16 @@ function patchCdnOnComplete() {
                     // 判断是图片还是视频，存入对应队列
                     if (videoId !== null && videoId !== "") {
                         // 视频
-                        pushVideoUploadInfo({
-                            cdnKey: cdnKey,
-                            aesKey: aesKey,
-                            md5Key: md5Key,
-                            videoIdentity: videoId,
-                            targetId: targetId
-                        });
                         send({
                             type: "upload_video_finish",
                             target_id: targetId,
                             cdn_key: cdnKey,
                             aes_key: aesKey,
-                            md5_key: md5Key
+                            md5_key: md5Key,
+                            video_id: videoId
                         });
                     } else {
                         // 图片
-                        pushImageUploadInfo({
-                            cdnKey: cdnKey,
-                            aesKey: aesKey,
-                            md5Key: md5Key,
-                            targetId: targetId
-                        });
                         send({
                             type: "upload_image_finish",
                             target_id: targetId,

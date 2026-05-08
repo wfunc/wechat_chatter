@@ -50,12 +50,16 @@ type SendMsg struct {
 	Content string
 	Type    string
 	AtUser  string
-	
+
 	FIleCdnUrl string
 	Md5        string
 	AesKey     string
 	FilePath   string
 	FileType   int
+
+	CdnKey  string
+	Md5Key  string
+	VideoId string
 }
 
 // SendRequest 请求结构体

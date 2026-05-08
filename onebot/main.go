@@ -225,6 +225,15 @@ func loadJs() {
 									m.GroupID = targetIdStr
 								}
 							}
+							if cdnKey, ok := pMap["cdn_key"]; ok {
+								m.CdnKey = cdnKey.(string)
+							}
+							if aesKey, ok := pMap["aes_key"]; ok {
+								m.AesKey = aesKey.(string)
+							}
+							if md5Key, ok := pMap["md5_key"]; ok {
+								m.Md5Key = md5Key.(string)
+							}
 							msgChan <- m
 						case "upload_video_finish":
 							m := &SendMsg{
@@ -237,6 +246,18 @@ func loadJs() {
 								} else {
 									m.GroupID = targetIdStr
 								}
+							}
+							if cdnKey, ok := pMap["cdn_key"]; ok {
+								m.CdnKey = cdnKey.(string)
+							}
+							if aesKey, ok := pMap["aes_key"]; ok {
+								m.AesKey = aesKey.(string)
+							}
+							if md5Key, ok := pMap["md5_key"]; ok {
+								m.Md5Key = md5Key.(string)
+							}
+							if videoId, ok := pMap["video_id"]; ok {
+								m.VideoId = videoId.(string)
 							}
 							msgChan <- m
 						case "download":

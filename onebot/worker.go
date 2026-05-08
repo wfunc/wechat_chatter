@@ -73,7 +73,7 @@ func SendWechatMsg(m *SendMsg) {
 			return
 		}
 	case "send_image":
-		result := fridaScript.ExportsCall("triggerSendImgMessage", currTaskId, myWechatId, targetId)
+		result := fridaScript.ExportsCall("triggerSendImgMessage", currTaskId, myWechatId, targetId, m.CdnKey, m.AesKey, m.Md5Key)
 		Info("📩 发送图片任务执行结果", "result", result, "task_id", currTaskId, "wechat_id", myWechatId, "target_id", targetId)
 		if result != "1" {
 			Error("上传图片失败", "task_id", currTaskId, "target_id", targetId, "result", result)
@@ -93,7 +93,7 @@ func SendWechatMsg(m *SendMsg) {
 			return
 		}
 	case "send_video":
-		result := fridaScript.ExportsCall("triggerSendVideoMessage", currTaskId, myWechatId, targetId)
+		result := fridaScript.ExportsCall("triggerSendVideoMessage", currTaskId, myWechatId, targetId, m.CdnKey, m.AesKey, m.Md5Key, m.VideoId)
 		Info("📩 发送视频任务执行结果", "result", result, "task_id", currTaskId, "wechat_id", myWechatId, "target_id", targetId)
 		if result != "1" {
 			Error("上传图片失败", "task_id", currTaskId, "target_id", targetId, "result", result)
