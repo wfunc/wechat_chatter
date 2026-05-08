@@ -73,7 +73,8 @@ func SendWechatMsg(m *SendMsg) {
 			return
 		}
 		
-		result := fridaScript.ExportsCall("triggerUploadImg", targetId, md5Str, targetPath)
+		uploadPayloadHex := BuildUploadPayload("img")
+		result := fridaScript.ExportsCall("triggerUploadImg", targetId, md5Str, targetPath, uploadPayloadHex)
 		Info("📩 上传图片任务执行结果", "result", result, "target_id", targetId, "md5", md5Str, "path", targetPath)
 		if result != "0" {
 			Error("上传图片失败", "target_id", targetId, "md5", md5Str, "result", result)
@@ -112,7 +113,8 @@ func SendWechatMsg(m *SendMsg) {
 		}
 		videoInfoMap.Store(targetId, info)
 
-		result := fridaScript.ExportsCall("triggerUploadVideo", targetId, md5Str, targetPath)
+		uploadPayloadHex := BuildUploadPayload("video")
+		result := fridaScript.ExportsCall("triggerUploadVideo", targetId, md5Str, targetPath, uploadPayloadHex)
 		Info("📩 上传视频任务执行结果", "result", result, "target_id", targetId, "md5", md5Str, "path", targetPath, "duration", info.Duration, "size", info.VideoSize)
 		if result != "0" {
 			Error("上传视频失败", "target_id", targetId, "md5", md5Str, "result", result)
