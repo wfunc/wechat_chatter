@@ -129,7 +129,7 @@ function getProtobufRawBytes(pBuffer, scanSize) {
                     if (targetTag === 0x42) {
                         finalResults.push(rawData);
                     } else {
-                        finalResults.push(getCleanString(rawData));
+                        finalResults.push(decodeProtobufString(rawData));
                     }
                     i += length;
                 } else {
@@ -216,6 +216,110 @@ function getCleanString(uint8Array) {
         }
     }
     return out;
+}
+
+function readProtobufVarint(uint8Array, offset) {
+    let value = 0;
+    let shift = 0;
+
+    for (let i = offset; i < uint8Array.length && i - offset < 10; i++) {
+        const b = uint8Array[i];
+        value += (b & 0x7F) * Math.pow(2, shift);
+        if ((b & 0x80) === 0) {
+            return {value: value, nextOffset: i + 1};
+        }
+        shift += 7;
+    }
+
+    return null;
+}
+
+function decodeProtobufString(uint8Array, depth) {
+    if (depth === undefined) {
+        depth = 0;
+    }
+
+    if (depth < 2) {
+        const nested = tryDecodeNestedProtobufString(uint8Array, depth);
+        if (nested !== null) {
+            return nested;
+        }
+    }
+
+    return getCleanString(uint8Array);
+}
+
+function tryDecodeNestedProtobufString(uint8Array, depth) {
+    if (!uint8Array || uint8Array.length < 2) {
+        return null;
+    }
+
+    let offset = 0;
+    const candidates = [];
+
+    while (offset < uint8Array.length) {
+        const tagInfo = readProtobufVarint(uint8Array, offset);
+        if (!tagInfo) {
+            return null;
+        }
+
+        const fieldNumber = Math.floor(tagInfo.value / 8);
+        const wireType = tagInfo.value & 0x07;
+        if (fieldNumber <= 0) {
+            return null;
+        }
+
+        offset = tagInfo.nextOffset;
+        if (wireType === 2) {
+            const lenInfo = readProtobufVarint(uint8Array, offset);
+            if (!lenInfo) {
+                return null;
+            }
+
+            const valueStart = lenInfo.nextOffset;
+            const valueEnd = valueStart + lenInfo.value;
+            if (valueEnd > uint8Array.length) {
+                return null;
+            }
+
+            const value = uint8Array.slice(valueStart, valueEnd);
+            const text = decodeProtobufString(value, depth + 1);
+            if (text) {
+                candidates.push({fieldNumber: fieldNumber, text: text});
+            }
+            offset = valueEnd;
+        } else if (wireType === 0) {
+            const valueInfo = readProtobufVarint(uint8Array, offset);
+            if (!valueInfo) {
+                return null;
+            }
+            offset = valueInfo.nextOffset;
+        } else if (wireType === 1) {
+            offset += 8;
+            if (offset > uint8Array.length) {
+                return null;
+            }
+        } else if (wireType === 5) {
+            offset += 4;
+            if (offset > uint8Array.length) {
+                return null;
+            }
+        } else {
+            return null;
+        }
+    }
+
+    if (candidates.length === 0) {
+        return null;
+    }
+
+    for (const candidate of candidates) {
+        if (candidate.fieldNumber === 2) {
+            return candidate.text;
+        }
+    }
+
+    return candidates.map(candidate => candidate.text).join("");
 }
 
 function protobufVarintToNumberString(uint8Array) {
@@ -503,7 +607,7 @@ function triggerSendTextMessage(taskId, receiver, content, atUser) {
         processNextTextMessage();
     }
 
-    return "ok";
+    return "1";
 }
 
 function processNextTextMessage() {
