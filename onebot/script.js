@@ -6,6 +6,14 @@ if (!baseAddr) {
 console.log("[+] WeChat base address: " + baseAddr);
 
 // -------------------------基础函数分区-------------------------
+function hexToByteArray(hexStr) {
+    var bytes = [];
+    for (var i = 0; i < hexStr.length; i += 2) {
+        bytes.push(parseInt(hexStr.substr(i, 2), 16));
+    }
+    return bytes;
+}
+
 function toVarint(n) {
     let res = [];
     while (n >= 128) {
@@ -206,6 +214,8 @@ var videoCdnKeyGlobal = "";
 var videoAesKeyGlobal = "";
 var videoMd5KeyGlobal = "";
 var videoIdGlobal = "";
+// 文本消息protobuf全局变量 (从Go直接传入hex编码)
+var textProtoHexGlobal = "";
 
 const fileCp = generateBytes(16)
 
@@ -303,7 +313,7 @@ function patchTextProtoBuf() {
 
 setImmediate(patchTextProtoBuf);
 
-function triggerSendTextMessage(taskId, receiver, content, atUser) {
+function triggerSendTextMessage(taskId, receiver, content, atUser, protoHex) {
     // console.log("[+] Manual Trigger Started...");
     if (!taskId || !receiver || !content) {
         console.error("[!] taskId or Receiver or Content is empty!");
@@ -321,7 +331,8 @@ function triggerSendTextMessage(taskId, receiver, content, atUser) {
     taskIdGlobal = taskId;
     receiverGlobal = receiver;
     contentGlobal = content;
-    atUserGlobal = atUser
+    atUserGlobal = atUser;
+    textProtoHexGlobal = protoHex;
     console.log("triggerSendTextMessage: receiver=" + receiverGlobal);
 
     textMessageAddr.add(0x08).writeU32(taskIdGlobal);
@@ -434,48 +445,16 @@ function attachSendTextProto() {
             }
             console.log(`[+] 注入 Protobuf: receiver=${receiverGlobal}`);
 
-            const type = [0x08, 0x01, 0x12]
-            const receiverHeader = [0x0A, receiverGlobal.length + 2, 0x0A, receiverGlobal.length];
-            const receiverProto = stringToHexArray(receiverGlobal);
-            const contentProto = stringToHexArray(contentGlobal);
-            const contentHeader = [0x12, ...toVarint(contentProto.length)];
-            const tsHeader = [0x18, 0x01, 0x20];
-            const tsBytes = getVarintTimestampBytes();
-            const msgIdHeader = [0x28]
-            const msgId = generateRandom5ByteVarint()
-
-            const htmlUpperPart = [0x3C, 0x6D, 0x73, 0x67, 0x73, 0x6F, 0x75, 0x72, 0x63, 0x65, 0x3E]
-            let atUserHeader = []
-            if (atUserGlobal) {
-                atUserHeader = atUserHeader.concat([0x3C, 0x61, 0x74, 0x75, 0x73, 0x65, 0x72, 0x6c, 0x69, 0x73, 0x74, 0x3e]).concat(stringToHexArray(atUserGlobal)).concat([0x3C, 0x2F, 0x61, 0x74, 0x75, 0x73, 0x65, 0x72, 0x6C, 0x69, 0x73, 0x74, 0x3E])
+            // 使用Go传入的protobuf数据
+            if (!textProtoHexGlobal || textProtoHexGlobal.length === 0) {
+                console.error("[!] textProtoHexGlobal 为空");
+                return;
             }
-            const htmlLowerPart = [0x3C, 0x61, 0x6C, 0x6E, 0x6F,
-                0x64, 0x65, 0x3E, 0x3C, 0x66, 0x72, 0x3E, 0x31,
-                0x3C, 0x2F, 0x66, 0x72, 0x3E, 0x3C, 0x2F, 0x61,
-                0x6C, 0x6E, 0x6F, 0x64, 0x65, 0x3E, 0x3C, 0x2F,
-                0x6D, 0x73, 0x67, 0x73, 0x6F, 0x75, 0x72,
-                0x63, 0x65, 0x3E, 0x00]
 
-            const htmlHeader = [0x32, htmlUpperPart.length + atUserHeader.length + htmlLowerPart.length]
-
-
-            const valueLen = toVarint(receiverHeader.length + receiverProto.length + contentHeader.length +
-                contentProto.length + tsHeader.length + tsBytes.length + msgIdHeader.length + msgId.length + htmlHeader.length +
-                htmlUpperPart.length + atUserHeader.length + htmlLowerPart.length)
-
-            // 合并数组
-            const finalPayload = type.concat(valueLen).concat(receiverHeader).concat(receiverProto).concat(contentHeader).concat(contentProto).concat(tsHeader).concat(tsBytes).concat(msgIdHeader).concat(msgId).concat(htmlHeader).concat(htmlUpperPart).concat(atUserHeader).concat(htmlLowerPart);
-
+            const finalPayload = hexToByteArray(textProtoHexGlobal);
             textProtoX1PayloadAddr.writeByteArray(finalPayload);
             this.context.x1 = textProtoX1PayloadAddr;
             this.context.x2 = ptr(finalPayload.length);
-
-            // console.log("[+] 文本寄存器修改完成: X1=" + this.context.x1 + ", X2=" + this.context.x2, hexdump(textProtoX1PayloadAddr, {
-            //     offset: 0,
-            //     length: 128,
-            //     header: true,
-            //     ansi: true
-            // }));
         },
     });
 }

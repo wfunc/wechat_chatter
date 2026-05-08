@@ -53,7 +53,12 @@ func SendWechatMsg(m *SendMsg) {
 	
 	switch m.Type {
 	case "text":
-		result := fridaScript.ExportsCall("triggerSendTextMessage", currTaskId, targetId, m.Content, m.AtUser)
+		protoHex, err := BuildTextMsgProto(targetId, m.Content, m.AtUser)
+		if err != nil {
+			Error("构建文本protobuf失败", "err", err)
+			return
+		}
+		result := fridaScript.ExportsCall("triggerSendTextMessage", currTaskId, targetId, m.Content, m.AtUser, protoHex)
 		Info("📩 发送文本任务执行结果", "result", result, "task_id", currTaskId, "target_id", targetId, "at_user", m.AtUser)
 		if result != "1" {
 			Error("发送文本失败", "task_id", currTaskId, "target_id", targetId, "result", result)

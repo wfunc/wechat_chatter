@@ -20,21 +20,21 @@ func sendHandler(w http.ResponseWriter, r *http.Request) {
 		Error("仅支持 POST")
 		return
 	}
-	
+
 	req := new(SendRequest)
 	if err := json.NewDecoder(r.Body).Decode(req); err != nil {
 		http.Error(w, "无效的 JSON", http.StatusBadRequest)
 		Error("无效的 JSON")
 		return
 	}
-	
+
 	// 参数校验
 	if len(req.Message) == 0 || (req.UserID == "" && req.GroupID == "") {
 		http.Error(w, "参数缺失", http.StatusBadRequest)
 		Error("参数缺失")
 		return
 	}
-	
+
 	sendContent := ""
 	atUserID := ""
 	for _, v := range req.Message {
@@ -47,7 +47,7 @@ func sendHandler(w http.ResponseWriter, r *http.Request) {
 					atUserID += v.Data.QQ + ","
 				}
 			}
-			
+
 		} else if v.Type == "image" || v.Type == "video" {
 			msgChan <- &SendMsg{
 				UserId:  req.UserID,
@@ -57,7 +57,7 @@ func sendHandler(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	
+
 	if sendContent != "" {
 		msgChan <- &SendMsg{
 			UserId:  req.UserID,
@@ -67,7 +67,7 @@ func sendHandler(w http.ResponseWriter, r *http.Request) {
 			AtUser:  strings.TrimRight(atUserID, ","),
 		}
 	}
-	
+
 	json.NewEncoder(w).Encode(map[string]any{
 		"status": "ok",
 	})
@@ -79,7 +79,7 @@ func SendHttpReq(jsonData []byte) {
 			Error("http panic", "err", r, "stack", string(debug.Stack()))
 		}
 	}()
-	
+
 	time.Sleep(time.Duration(config.SendInterval) * time.Millisecond)
 	jsonReq, err := HandleMsg(jsonData)
 	if err != nil {
@@ -89,20 +89,20 @@ func SendHttpReq(jsonData []byte) {
 	if jsonReq == nil {
 		return
 	}
-	
+
 	Info("发送数据", "msg", string(jsonReq))
 	req, err := http.NewRequest("POST", config.SendURL, bytes.NewBuffer(jsonReq))
 	if err != nil {
 		Error("创建请求失败", "err", err)
 		return
 	}
-	
+
 	// 5. 设置 Header (OneBot 接口通常要求 application/json)
 	h := hmac.New(sha1.New, []byte(config.OnebotToken))
 	h.Write(jsonReq)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Signature", "sha1="+hex.EncodeToString(h.Sum(nil)))
-	
+
 	client := &http.Client{
 		Timeout: 10 * time.Second,
 	}
@@ -113,13 +113,13 @@ func SendHttpReq(jsonData []byte) {
 		return
 	}
 	defer resp.Body.Close()
-	
+
 	// 7. 读取返回结果
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		Error("读取响应失败", "err", err)
 		return
 	}
-	
+
 	Info("返回内容", "status", resp.StatusCode, "body", string(body))
 }
