@@ -199,6 +199,8 @@ func loadJs() {
 					payloadJson, _ := json.Marshal(pMap)
 					if t, ok := pMap["type"]; ok {
 						switch t.(string) {
+						case "protobuf_msg":
+							go HandleProtobufMsgAndSend(pMap)
 						case "send":
 							if config.ConnType == "http" {
 								go SendHttpReq(payloadJson)
