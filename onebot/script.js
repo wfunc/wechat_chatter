@@ -42,7 +42,7 @@ function generateAESKey() {
 
 // 文本消息全局变量
 var textCallbackFuncAddr = baseAddr.add({{.textCallbackFuncAddr}});
-var protobufAddr = textCallbackFuncAddr.add(0x44);
+var protobufAddr = textCallbackFuncAddr.add(0x40);
 var patchTextProtobufAddr = textCallbackFuncAddr.add(0x20);
 var patchTextProtobufByte
 var patchTextProtobufDeleteAddr = textCallbackFuncAddr.add(0x5C);
@@ -688,10 +688,10 @@ function triggerUploadImg(receiver, md5, imagePath, payloadHex) {
     uploadImageX1.add(0x48).writePointer(imageIdAddr);
     uploadImageX1.add(0x68).writeUtf8String(receiver);
     uploadImageX1.add(0xa8).writePointer(md5Addr);
-    uploadImageX1.add(0xe0).writePointer(ImagePathAddr1);
-    uploadImageX1.add(0x110).writePointer(ImagePathAddr1);
-    uploadImageX1.add(0x140).writePointer(ImagePathAddr1);
-    uploadImageX1.add(0x1f8).writePointer(uploadAesKeyAddr);
+    uploadImageX1.add(0xe8).writePointer(ImagePathAddr1);
+    uploadImageX1.add(0x118).writePointer(ImagePathAddr1);
+    uploadImageX1.add(0x148).writePointer(ImagePathAddr1);
+    uploadImageX1.add(0x200).writePointer(uploadAesKeyAddr);
 
     const startUploadMedia = new NativeFunction(uploadImageAddr, 'int64', ['pointer', 'pointer']);
 
@@ -718,10 +718,10 @@ function triggerUploadVideo(receiver, md5, videoPath, payloadHex) {
     uploadVideoX1.add(0x48).writePointer(videoIdAddr);
     uploadVideoX1.add(0x68).writeUtf8String(receiver);
     uploadVideoX1.add(0xa8).writePointer(md5Addr);
-    uploadVideoX1.add(0xe0).writePointer(videoPathAddr1);
-    uploadVideoX1.add(0x110).writePointer(videoPathAddr1);
-    uploadVideoX1.add(0x140).writePointer(videoPathAddr1);
-    uploadVideoX1.add(0x1f8).writePointer(uploadAesKeyAddr);
+    uploadVideoX1.add(0xe8).writePointer(videoPathAddr1);
+    uploadVideoX1.add(0x118).writePointer(videoPathAddr1);
+    uploadVideoX1.add(0x148).writePointer(videoPathAddr1);
+    uploadVideoX1.add(0x200).writePointer(uploadAesKeyAddr);
 
     const startUploadMedia = new NativeFunction(uploadImageAddr, 'int64', ['pointer', 'pointer']);
 
@@ -734,7 +734,7 @@ function attachUploadMedia() {
             try {
                 uploadGlobalX0 = this.context.x0;
                 const selfId = this.context.x1.add(0x68).readUtf8String();
-                const filePath = this.context.x1.add(0xe0).readPointer().readUtf8String();
+                const filePath = this.context.x1.add(0xe8).readPointer().readUtf8String();
                 send({
                     type: "upload",
                     self_id: selfId,
