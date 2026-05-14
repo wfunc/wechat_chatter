@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -120,6 +121,22 @@ type videoXML struct {
 		PlayLen   int    `xml:"playlength,attr"`
 		ThumbSize int    `xml:"cdnthumblength,attr"`
 	} `xml:"videomsg"`
+}
+
+type sysMsgXML struct {
+	Type                 string            `xml:"type,attr"`
+	DelChatRoomMember    sysMemberEventXML `xml:"delchatroommember"`
+	InviteChatRoomMember sysMemberEventXML `xml:"invitechatroommember"`
+}
+
+type sysMemberEventXML struct {
+	Plain string `xml:"plain"`
+	Text  string `xml:"text"`
+	Link  struct {
+		Scene      string   `xml:"scene"`
+		Text       string   `xml:"text"`
+		MemberList []string `xml:"memberlist>username"`
+	} `xml:"link"`
 }
 
 type sendRequest struct {
@@ -573,6 +590,8 @@ func buildDisplayParts(msg wechatMessage) []displayPart {
 			parts = append(parts, displayPart{Type: "video", Text: data.Text, URL: data.URL, FilePath: filePathFromURL(data.URL), Title: videoTitle(data.Text)})
 		case "at":
 			parts = append(parts, displayPart{Type: "text", Text: "@" + data.QQ})
+		case "sys":
+			parts = append(parts, displayPart{Type: "sys", Text: sysMessageText(data.Text), Title: sysMessageTitle(data.Text)})
 		default:
 			parts = append(parts, displayPart{Type: part.Type, Text: firstNonEmpty(data.Text, data.File, data.URL)})
 		}
@@ -581,6 +600,71 @@ func buildDisplayParts(msg wechatMessage) []displayPart {
 		parts = append(parts, displayPart{Type: "text", Text: msg.RawMessage})
 	}
 	return parts
+}
+
+func sysMessageTitle(raw string) string {
+	msg, ok := parseSysMessage(raw)
+	if !ok {
+		return "系统消息"
+	}
+
+	switch msg.Type {
+	case "delchatroommember":
+		scene := strings.TrimSpace(msg.DelChatRoomMember.Link.Scene)
+		switch scene {
+		case "invite":
+			return "群系统消息：邀请入群"
+		case "kickout":
+			return "群系统消息：移出群聊"
+		case "quit":
+			return "群系统消息：退出群聊"
+		default:
+			return "群系统消息：" + msg.Type
+		}
+	case "invitechatroommember":
+		return "群系统消息：邀请入群"
+	default:
+		if msg.Type != "" {
+			return "系统消息：" + msg.Type
+		}
+		return "系统消息"
+	}
+}
+
+func sysMessageText(raw string) string {
+	msg, ok := parseSysMessage(raw)
+	if !ok {
+		return firstNonEmpty(stripXMLText(raw), raw)
+	}
+
+	event := msg.DelChatRoomMember
+	if msg.Type == "invitechatroommember" {
+		event = msg.InviteChatRoomMember
+	}
+	text := firstNonEmpty(event.Plain, event.Text, stripXMLText(raw), raw)
+	if len(event.Link.MemberList) > 0 {
+		text += "\n成员：" + strings.Join(event.Link.MemberList, ", ")
+	}
+	if scene := strings.TrimSpace(event.Link.Scene); scene != "" {
+		text += "\n场景：" + scene
+	}
+	return text
+}
+
+func parseSysMessage(raw string) (sysMsgXML, bool) {
+	raw = strings.TrimSpace(strings.TrimPrefix(raw, `<?xml version="1.0"?>`))
+	var msg sysMsgXML
+	if err := xml.Unmarshal([]byte(raw), &msg); err != nil {
+		return msg, false
+	}
+	return msg, msg.Type != ""
+}
+
+func stripXMLText(raw string) string {
+	text := regexp.MustCompile(`<\!\[CDATA\[([\s\S]*?)\]\]>`).ReplaceAllString(raw, "$1")
+	text = regexp.MustCompile(`<[^>]+>`).ReplaceAllString(text, " ")
+	text = strings.Join(strings.Fields(text), " ")
+	return strings.TrimSpace(text)
 }
 
 func imageTitle(raw string) string {
@@ -949,6 +1033,12 @@ const indexHTML = `<!doctype html>
       border: 1px solid var(--line);
       background: #f0f2f4;
       object-fit: contain;
+      cursor: zoom-in;
+      transition: filter .15s ease, transform .15s ease;
+    }
+    img.media:hover {
+      filter: brightness(.96);
+      transform: translateY(-1px);
     }
     video.media {
       max-width: min(640px, 100%);
@@ -1028,6 +1118,43 @@ const indexHTML = `<!doctype html>
       grid-column: 1 / -1;
       color: var(--muted);
       font-size: 12px;
+    }
+    .lightbox {
+      position: fixed;
+      inset: 0;
+      z-index: 1000;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 28px;
+      background: rgba(9, 15, 22, .86);
+    }
+    .lightbox.open {
+      display: flex;
+    }
+    .lightbox img {
+      max-width: 96vw;
+      max-height: 92vh;
+      border-radius: 8px;
+      background: #111;
+      box-shadow: 0 18px 80px rgba(0,0,0,.42);
+      object-fit: contain;
+      cursor: zoom-out;
+    }
+    .lightbox-close {
+      position: absolute;
+      top: 14px;
+      right: 16px;
+      width: 42px;
+      height: 42px;
+      padding: 0;
+      border-radius: 999px;
+      font-size: 24px;
+      line-height: 1;
+      background: rgba(255,255,255,.16);
+    }
+    .lightbox-close:hover {
+      background: rgba(255,255,255,.28);
     }
     @media (max-width: 720px) {
       .bar, main { padding-left: 12px; padding-right: 12px; }
@@ -1125,7 +1252,7 @@ const indexHTML = `<!doctype html>
             <div class="part">
               <div class="part-label">{{.Type}} {{if .Title}}· {{.Title}}{{end}}</div>
               {{if eq .Type "image"}}
-                {{if mediaURL .}}<img class="media" src="{{mediaURL .}}" alt="图片消息">{{else}}<div class="text">图片文件尚未下载</div>{{end}}
+                {{if mediaURL .}}<img class="media" src="{{mediaURL .}}" data-full-src="{{mediaURL .}}" alt="图片消息">{{else}}<div class="text">图片文件尚未下载</div>{{end}}
                 {{if .FilePath}}<div class="raw">{{.FilePath}}</div>{{end}}
               {{else if eq .Type "video"}}
                 {{if mediaURL .}}<video class="media" src="{{mediaURL .}}" controls preload="metadata"></video>{{else}}<div class="text">视频文件尚未下载</div>{{end}}
@@ -1155,5 +1282,43 @@ const indexHTML = `<!doctype html>
       </article>
     {{end}}
   </main>
+  <div class="lightbox" id="imageLightbox" aria-hidden="true">
+    <button class="lightbox-close" type="button" aria-label="关闭">×</button>
+    <img alt="放大图片">
+  </div>
+  <script>
+    (function () {
+      var box = document.getElementById('imageLightbox');
+      if (!box) return;
+      var img = box.querySelector('img');
+      var close = box.querySelector('.lightbox-close');
+      function open(src) {
+        img.src = src;
+        box.classList.add('open');
+        box.setAttribute('aria-hidden', 'false');
+      }
+      function hide() {
+        box.classList.remove('open');
+        box.setAttribute('aria-hidden', 'true');
+        img.removeAttribute('src');
+      }
+      document.addEventListener('click', function (event) {
+        var target = event.target;
+        if (target && target.matches && target.matches('img.media[data-full-src]')) {
+          open(target.getAttribute('data-full-src'));
+        }
+      });
+      box.addEventListener('click', function (event) {
+        if (event.target === box || event.target === img || event.target === close) {
+          hide();
+        }
+      });
+      document.addEventListener('keydown', function (event) {
+        if (event.key === 'Escape' && box.classList.contains('open')) {
+          hide();
+        }
+      });
+    })();
+  </script>
 </body>
 </html>`
