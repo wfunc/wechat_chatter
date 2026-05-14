@@ -138,6 +138,24 @@ type videoXML struct {
 	} `xml:"videomsg"`
 }
 
+type appMsgXML struct {
+	AppMsg struct {
+		Title    string `xml:"title"`
+		Type     string `xml:"type"`
+		ReferMsg struct {
+			Content     string `xml:"content"`
+			CreateTime  int64  `xml:"createtime"`
+			DisplayName string `xml:"displayname"`
+			FromUser    string `xml:"fromusr"`
+			SvrID       string `xml:"svrid"`
+			MsgSource   string `xml:"msgsource"`
+			MsgType     string `xml:"type"`
+			ChatUser    string `xml:"chatusr"`
+		} `xml:"refermsg"`
+	} `xml:"appmsg"`
+	FromUsername string `xml:"fromusername"`
+}
+
 type sysMsgXML struct {
 	Type                 string            `xml:"type,attr"`
 	DelChatRoomMember    sysMemberEventXML `xml:"delchatroommember"`
@@ -825,7 +843,12 @@ func buildDisplayParts(msg wechatMessage) []displayPart {
 		data := part.Data
 		switch part.Type {
 		case "text":
-			parts = append(parts, displayPart{Type: "text", Text: firstNonEmpty(data.Text, msg.ShowContent)})
+			text := firstNonEmpty(data.Text, msg.ShowContent)
+			if quote, ok := quotedAppMessagePart(text); ok {
+				parts = append(parts, quote)
+				continue
+			}
+			parts = append(parts, displayPart{Type: "text", Text: text})
 		case "image":
 			parts = append(parts, displayPart{Type: "image", Text: data.Text, URL: data.URL, FilePath: filePathFromURL(data.URL), Title: imageTitle(data.Text)})
 		case "video":
@@ -835,13 +858,77 @@ func buildDisplayParts(msg wechatMessage) []displayPart {
 		case "sys":
 			parts = append(parts, displayPart{Type: "sys", Text: sysMessageText(data.Text), Title: sysMessageTitle(data.Text)})
 		default:
-			parts = append(parts, displayPart{Type: part.Type, Text: firstNonEmpty(data.Text, data.File, data.URL)})
+			text := firstNonEmpty(data.Text, data.File, data.URL)
+			if quote, ok := quotedAppMessagePart(text); ok {
+				parts = append(parts, quote)
+				continue
+			}
+			parts = append(parts, displayPart{Type: part.Type, Text: text})
 		}
 	}
 	if len(parts) == 0 && msg.RawMessage != "" {
 		parts = append(parts, displayPart{Type: "text", Text: msg.RawMessage})
 	}
 	return parts
+}
+
+func quotedAppMessagePart(raw string) (displayPart, bool) {
+	msg, ok := parseAppMessage(raw)
+	if !ok || strings.TrimSpace(msg.AppMsg.Type) != "57" {
+		return displayPart{}, false
+	}
+
+	lines := make([]string, 0, 8)
+	if title := strings.TrimSpace(msg.AppMsg.Title); title != "" {
+		lines = append(lines, title)
+	}
+
+	ref := msg.AppMsg.ReferMsg
+	refName := strings.TrimSpace(ref.DisplayName)
+	refContent := strings.TrimSpace(ref.Content)
+	switch {
+	case refName != "" && refContent != "":
+		lines = append(lines, "引用 "+refName+"："+refContent)
+	case refContent != "":
+		lines = append(lines, "引用："+refContent)
+	case refName != "":
+		lines = append(lines, "引用 "+refName+" 的消息")
+	}
+
+	details := make([]string, 0, 4)
+	if ref.ChatUser != "" {
+		details = append(details, "原发送人="+ref.ChatUser)
+	}
+	if ref.FromUser != "" {
+		details = append(details, "原会话="+ref.FromUser)
+	}
+	if ref.SvrID != "" {
+		details = append(details, "原消息ID="+ref.SvrID)
+	}
+	if msg.FromUsername != "" {
+		details = append(details, "发送人="+msg.FromUsername)
+	}
+	if len(details) > 0 {
+		lines = append(lines, strings.Join(details, " · "))
+	}
+
+	if len(lines) == 0 {
+		lines = append(lines, firstNonEmpty(stripXMLText(raw), raw))
+	}
+	return displayPart{
+		Type:  "quote",
+		Title: "引用回复",
+		Text:  strings.Join(lines, "\n"),
+	}, true
+}
+
+func parseAppMessage(raw string) (appMsgXML, bool) {
+	raw = strings.TrimSpace(strings.TrimPrefix(raw, `<?xml version="1.0"?>`))
+	var msg appMsgXML
+	if err := xml.Unmarshal([]byte(raw), &msg); err != nil {
+		return msg, false
+	}
+	return msg, strings.TrimSpace(msg.AppMsg.Type) != ""
 }
 
 func sysMessageTitle(raw string) string {
