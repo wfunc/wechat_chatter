@@ -17,3 +17,32 @@ func TestIsConversationOpMessageRejectsChatText(t *testing.T) {
 		t.Fatal("sysmsg should not be detected as op message")
 	}
 }
+
+func TestIsSecuritySysMessage(t *testing.T) {
+	content := `<sysmsg type="secmsg">
+  <secmsg>
+    <session>57066484707@chatroom</session>
+    <newmsgid>1187626774747965624</newmsgid>
+    <sec_msg_node>
+      <show-h5></show-h5>
+      <clip-len></clip-len>
+      <risk-file-flag></risk-file-flag>
+    </sec_msg_node>
+  </secmsg>
+</sysmsg>`
+	if !isSecuritySysMessage(content) {
+		t.Fatal("expected secmsg to be detected")
+	}
+}
+
+func TestIsSecuritySysMessageRejectsVisibleSysMessages(t *testing.T) {
+	for _, content := range []string{
+		`<sysmsg type="revokemsg"><revokemsg><replacemsg>"A" 撤回了一条消息</replacemsg></revokemsg></sysmsg>`,
+		`<sysmsg type="delchatroommember"><delchatroommember><plain>有人加入了群聊</plain></delchatroommember></sysmsg>`,
+		`<?xml version="1.0"?><msg><img><secHashInfoBase64 /></img></msg>`,
+	} {
+		if isSecuritySysMessage(content) {
+			t.Fatalf("visible message should not be detected as secmsg: %s", content)
+		}
+	}
+}
