@@ -133,7 +133,12 @@ func HandleProtobufMsg(payload map[string]interface{}) ([]byte, error) {
 		}
 	}
 
-	myWechatId = selfId
+	if myWechatId == "" {
+		setMyWechatId(selfId)
+	}
+	if strings.Contains(selfId, "@chatroom") && myWechatId != "" {
+		selfId = myWechatId
+	}
 	if groupId != "" {
 		userID2NicknameMap.Store(groupId+"_"+senderUser, senderNickname)
 	}

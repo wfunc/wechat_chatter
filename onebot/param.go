@@ -2,6 +2,8 @@ package main
 
 import (
 	"encoding/xml"
+	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/frida/frida-go/frida"
@@ -24,6 +26,37 @@ var (
 	userID2FileMsgMap  sync.Map
 	videoInfoMap       sync.Map // targetId -> *VideoInfo
 )
+
+func setMyWechatId(selfID string) {
+	selfID = strings.TrimSpace(selfID)
+	if selfID == "" || strings.Contains(selfID, "@chatroom") {
+		return
+	}
+	myWechatId = selfID
+}
+
+func validMyWechatId() bool {
+	return myWechatId != "" && !strings.Contains(myWechatId, "@chatroom")
+}
+
+func inferMyWechatIdFromImagePath(imagePath string) {
+	if myWechatId != "" {
+		return
+	}
+	imagePath = filepath.Clean(imagePath)
+	parts := strings.Split(imagePath, string(filepath.Separator))
+	for _, part := range parts {
+		if !strings.HasPrefix(part, "wxid_") {
+			continue
+		}
+		if idx := strings.LastIndex(part, "_"); idx > len("wxid_") {
+			setMyWechatId(part[:idx])
+			return
+		}
+		setMyWechatId(part)
+		return
+	}
+}
 
 type WechatMessage struct {
 	GroupId     string     `json:"group_id"`

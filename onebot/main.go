@@ -82,6 +82,11 @@ func initFlag() {
 	fmt.Println("SendInterval", config.SendInterval)
 	fmt.Println("WechatPid", config.WechatPid)
 	fmt.Println("LogLevel", logLevel)
+
+	inferMyWechatIdFromImagePath(config.ImagePath)
+	if myWechatId != "" {
+		fmt.Println("MyWechatId", myWechatId)
+	}
 }
 
 func initFridaGadget() {
@@ -271,7 +276,7 @@ func loadJs() {
 							finishChan <- struct{}{}
 						case "upload":
 							if selfId, ok := pMap["self_id"]; ok && myWechatId == "" {
-								myWechatId = selfId.(string)
+								setMyWechatId(selfId.(string))
 							}
 						case "upload_image_finish":
 							m := &SendMsg{
