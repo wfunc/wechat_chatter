@@ -97,3 +97,26 @@ func TestBroadcastEvent(t *testing.T) {
 		t.Fatal("expected event to be delivered")
 	}
 }
+
+func TestFilterMessages(t *testing.T) {
+	messages := []storedMessage{
+		{Wechat: wechatMessage{GroupID: "g1@chatroom", UserID: "u1"}},
+		{Wechat: wechatMessage{GroupID: "g2@chatroom", UserID: "u1"}},
+		{Wechat: wechatMessage{GroupID: "g1@chatroom", UserID: "u2"}},
+	}
+
+	byUser := filterMessages(messages, viewFilter{Kind: "user", ID: "u1"})
+	if len(byUser) != 2 {
+		t.Fatalf("user filter len = %d", len(byUser))
+	}
+
+	byGroup := filterMessages(messages, viewFilter{Kind: "group", ID: "g1@chatroom"})
+	if len(byGroup) != 2 {
+		t.Fatalf("group filter len = %d", len(byGroup))
+	}
+
+	all := filterMessages(messages, viewFilter{})
+	if len(all) != 3 {
+		t.Fatalf("empty filter len = %d", len(all))
+	}
+}

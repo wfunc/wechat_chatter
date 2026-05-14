@@ -109,6 +109,13 @@ type groupNameEntry struct {
 	Name    string
 }
 
+type viewFilter struct {
+	Kind     string
+	ID       string
+	Label    string
+	ReturnTo string
+}
+
 type persistedState struct {
 	RepeatGroups  []string          `json:"repeat_groups"`
 	HiddenTargets []hiddenTarget    `json:"hidden_targets"`
@@ -318,6 +325,8 @@ func (s *appState) handleIndex(cfg appConfig) http.HandlerFunc {
 		"chatLabel":  chatLabel,
 		"chatType":   chatType,
 		"targetID":   targetID,
+		"userURL":    userURL,
+		"groupURL":   groupURL,
 		"mediaURL":   mediaURL,
 		"avatarURL":  avatarURL,
 		"avatarText": avatarText,
@@ -330,14 +339,15 @@ func (s *appState) handleIndex(cfg appConfig) http.HandlerFunc {
 			return
 		}
 
+		filter := parseViewFilter(r)
 		s.mu.RLock()
-		messages := make([]storedMessage, len(s.messages))
-		copy(messages, s.messages)
+		messages := filterMessages(s.messages, filter)
 		s.mu.RUnlock()
 
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		if err := tmpl.Execute(w, map[string]any{
 			"Messages":      messages,
+			"Filter":        filter,
 			"Onebot":        cfg.onebotBase,
 			"RepeatGroups":  s.repeatGroupList(),
 			"HiddenTargets": s.hiddenTargetList(),
@@ -432,7 +442,7 @@ func (s *appState) handleReply(cfg appConfig) http.HandlerFunc {
 			return
 		}
 
-		http.Redirect(w, r, "/", http.StatusSeeOther)
+		redirectBack(w, r)
 	}
 }
 
@@ -496,7 +506,7 @@ func (s *appState) handleSendImage(cfg appConfig) http.HandlerFunc {
 			return
 		}
 
-		http.Redirect(w, r, "/", http.StatusSeeOther)
+		redirectBack(w, r)
 	}
 }
 
@@ -971,6 +981,55 @@ func postOnebot(base, endpoint string, req sendRequest) error {
 	return nil
 }
 
+func parseViewFilter(r *http.Request) viewFilter {
+	groupID := strings.TrimSpace(r.URL.Query().Get("group_id"))
+	userID := strings.TrimSpace(r.URL.Query().Get("user_id"))
+	switch {
+	case groupID != "":
+		return viewFilter{
+			Kind:     "group",
+			ID:       groupID,
+			Label:    "群ID：" + groupID,
+			ReturnTo: "/?group_id=" + url.QueryEscape(groupID),
+		}
+	case userID != "":
+		return viewFilter{
+			Kind:     "user",
+			ID:       userID,
+			Label:    "微信ID：" + userID,
+			ReturnTo: "/?user_id=" + url.QueryEscape(userID),
+		}
+	default:
+		return viewFilter{ReturnTo: "/"}
+	}
+}
+
+func filterMessages(messages []storedMessage, filter viewFilter) []storedMessage {
+	filtered := make([]storedMessage, 0, len(messages))
+	for _, msg := range messages {
+		switch filter.Kind {
+		case "group":
+			if msg.Wechat.GroupID != filter.ID {
+				continue
+			}
+		case "user":
+			if msg.Wechat.UserID != filter.ID {
+				continue
+			}
+		}
+		filtered = append(filtered, msg)
+	}
+	return filtered
+}
+
+func redirectBack(w http.ResponseWriter, r *http.Request) {
+	returnTo := strings.TrimSpace(r.FormValue("return_to"))
+	if returnTo == "" || !strings.HasPrefix(returnTo, "/") || strings.HasPrefix(returnTo, "//") {
+		returnTo = "/"
+	}
+	http.Redirect(w, r, returnTo, http.StatusSeeOther)
+}
+
 func buildDisplayParts(msg wechatMessage) []displayPart {
 	return (*appState)(nil).buildDisplayParts(msg)
 }
@@ -1347,6 +1406,22 @@ func targetID(m wechatMessage) string {
 	return m.UserID
 }
 
+func userURL(m wechatMessage) string {
+	userID := strings.TrimSpace(m.UserID)
+	if userID == "" {
+		return "/"
+	}
+	return "/?user_id=" + url.QueryEscape(userID)
+}
+
+func groupURL(m wechatMessage) string {
+	groupID := strings.TrimSpace(m.GroupID)
+	if groupID == "" {
+		return "/"
+	}
+	return "/?group_id=" + url.QueryEscape(groupID)
+}
+
 func avatarURL(m wechatMessage) string {
 	if m.Sender != nil {
 		if strings.TrimSpace(m.Sender.AvatarURL) != "" {
@@ -1566,11 +1641,28 @@ const indexHTML = `<!doctype html>
       border-color: var(--accent);
       background: var(--accent);
     }
+    .badge.link {
+      color: var(--accent-dark);
+      text-decoration: none;
+    }
+    .badge.link:hover {
+      border-color: var(--accent);
+      color: #fff;
+      background: var(--accent);
+    }
     .idline {
       margin-top: 7px;
       color: var(--muted);
       font-size: 13px;
       word-break: break-all;
+    }
+    .idline a {
+      color: var(--accent-dark);
+      text-decoration: none;
+      font-weight: 700;
+    }
+    .idline a:hover {
+      text-decoration: underline;
     }
     .time {
       color: var(--muted);
@@ -1763,6 +1855,15 @@ const indexHTML = `<!doctype html>
     </div>
   </header>
   <main>
+    {{if .Filter.Kind}}
+      <section class="rule-panel">
+        <div class="rule-row">
+          <span class="badge kind">当前筛选</span>
+          <span class="badge">{{.Filter.Label}}</span>
+          <a class="badge link" href="/">返回全部消息</a>
+        </div>
+      </section>
+    {{end}}
     <section class="rule-panel">
       <h2 class="rule-title">额外监听群</h2>
       <form class="rule-form" method="post" action="/repeat-groups">
@@ -1845,13 +1946,13 @@ const indexHTML = `<!doctype html>
             <div class="identity">
               <span class="badge kind">{{chatLabel .Wechat}}</span>
               <span class="badge">微信昵称：{{if .Wechat.Sender}}{{.Wechat.Sender.Nickname}}{{else}}未知{{end}}</span>
-              <span class="badge">微信ID：{{.Wechat.UserID}}</span>
+              <a class="badge link" href="{{userURL .Wechat}}">微信ID：{{.Wechat.UserID}}</a>
             </div>
             <div class="idline">
               {{if .Wechat.GroupID}}
-                群名：{{if groupName .Wechat}}{{groupName .Wechat}}{{else}}未设置{{end}} · 群ID：{{.Wechat.GroupID}}
+                群名：{{if groupName .Wechat}}{{groupName .Wechat}}{{else}}未设置{{end}} · 群ID：<a href="{{groupURL .Wechat}}">{{.Wechat.GroupID}}</a>
               {{else}}
-                个人会话：{{.Wechat.UserID}}
+                个人会话：<a href="{{userURL .Wechat}}">{{.Wechat.UserID}}</a>
               {{end}}
               {{if .Wechat.MessageID}} · 消息ID：{{.Wechat.MessageID}}{{end}}
             </div>
@@ -1883,6 +1984,7 @@ const indexHTML = `<!doctype html>
           <form class="reply" method="post" action="/reply">
             <input type="hidden" name="target" value="{{targetID .Wechat}}">
             <input type="hidden" name="chat_type" value="{{chatType .Wechat}}">
+            <input type="hidden" name="return_to" value="{{$.Filter.ReturnTo}}">
             <textarea name="text" placeholder="输入回复内容"></textarea>
             <button type="submit">回复</button>
             <div class="hint">回复目标：{{targetID .Wechat}}</div>
@@ -1890,6 +1992,7 @@ const indexHTML = `<!doctype html>
           <form class="image-reply" method="post" action="/send-image" enctype="multipart/form-data">
             <input type="hidden" name="target" value="{{targetID .Wechat}}">
             <input type="hidden" name="chat_type" value="{{chatType .Wechat}}">
+            <input type="hidden" name="return_to" value="{{$.Filter.ReturnTo}}">
             <input class="image-input" type="file" name="image" accept="image/*" required>
             <button type="submit">发送图片</button>
           </form>
