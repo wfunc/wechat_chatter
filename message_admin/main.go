@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -71,10 +72,20 @@ type displayPart struct {
 }
 
 type appState struct {
-	mu       sync.RWMutex
-	nextID   int64
-	messages []storedMessage
-	maxItems int
+	mu            sync.RWMutex
+	nextID        int64
+	messages      []storedMessage
+	maxItems      int
+	repeatMu      sync.Mutex
+	repeatGroups  map[string]struct{}
+	repeatByGroup map[string]repeatState
+}
+
+type repeatState struct {
+	LastUserID    string
+	LastText      string
+	LastMessageID string
+	TriggeredText string
 }
 
 type appConfig struct {
@@ -116,64 +127,80 @@ type sendMessage struct {
 
 func main() {
 	var cfg appConfig
+	var repeatGroups string
 	flag.StringVar(&cfg.listenAddr, "listen", "127.0.0.1:36060", "管理页面和 OneBot 回调监听地址")
 	flag.StringVar(&cfg.onebotBase, "onebot", "http://127.0.0.1:58080", "onebot 发送接口地址")
 	flag.IntVar(&cfg.maxMessages, "max", 500, "内存中最多保留的消息数量")
 	flag.StringVar(&cfg.staticPrefix, "static_prefix", "/file/", "本地 file:// 媒体代理路径前缀")
+	flag.StringVar(&repeatGroups, "repeat_groups", "", "启用连续重复内容自动跟发的群ID，多个用逗号分隔")
 	flag.Parse()
 
-	state := &appState{maxItems: cfg.maxMessages}
+	state := &appState{
+		maxItems:      cfg.maxMessages,
+		repeatGroups:  parseGroupSet(repeatGroups),
+		repeatByGroup: make(map[string]repeatState),
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", state.handleIndex(cfg))
-	mux.HandleFunc("/onebot", state.handleOnebot)
+	mux.HandleFunc("/onebot", state.handleOnebot(cfg))
 	mux.HandleFunc("/api/messages", state.handleMessages)
 	mux.HandleFunc("/reply", state.handleReply(cfg))
+	mux.HandleFunc("/repeat-groups", state.handleRepeatGroups)
 	mux.HandleFunc(cfg.staticPrefix, handleLocalFile(cfg.staticPrefix))
 
 	log.Printf("message admin listening on http://%s", cfg.listenAddr)
 	log.Printf("onebot send target: %s", strings.TrimRight(cfg.onebotBase, "/"))
+	if groups := state.repeatGroupList(); len(groups) > 0 {
+		log.Printf("repeat rule enabled for groups: %s", strings.Join(groups, ","))
+	}
 	if err := http.ListenAndServe(cfg.listenAddr, mux); err != nil {
 		log.Fatal(err)
 	}
 }
 
-func (s *appState) handleOnebot(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
+func (s *appState) handleOnebot(cfg appConfig) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
 
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 
-	var msg wechatMessage
-	if err := json.Unmarshal(body, &msg); err != nil {
-		http.Error(w, "invalid json: "+err.Error(), http.StatusBadRequest)
-		return
-	}
+		var msg wechatMessage
+		if err := json.Unmarshal(body, &msg); err != nil {
+			http.Error(w, "invalid json: "+err.Error(), http.StatusBadRequest)
+			return
+		}
 
-	item := storedMessage{
-		ReceivedAt: time.Now(),
-		RawJSON:    string(body),
-		Wechat:     msg,
-	}
-	item.DisplayParts = buildDisplayParts(msg)
+		item := storedMessage{
+			ReceivedAt: time.Now(),
+			RawJSON:    string(body),
+			Wechat:     msg,
+		}
+		item.DisplayParts = buildDisplayParts(msg)
 
-	s.mu.Lock()
-	s.nextID++
-	item.ID = s.nextID
-	s.messages = append([]storedMessage{item}, s.messages...)
-	if s.maxItems > 0 && len(s.messages) > s.maxItems {
-		s.messages = s.messages[:s.maxItems]
-	}
-	s.mu.Unlock()
+		s.mu.Lock()
+		s.nextID++
+		item.ID = s.nextID
+		s.messages = append([]storedMessage{item}, s.messages...)
+		if s.maxItems > 0 && len(s.messages) > s.maxItems {
+			s.messages = s.messages[:s.maxItems]
+		}
+		s.mu.Unlock()
 
-	log.Printf("received message id=%d type=%s user=%s group=%s parts=%d", item.ID, msg.MessageType, msg.UserID, msg.GroupID, len(msg.Message))
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "id": item.ID})
+		if err := s.applyRepeatRule(cfg, msg); err != nil {
+			log.Printf("repeat rule send failed group=%s user=%s err=%v", msg.GroupID, msg.UserID, err)
+		}
+
+		log.Printf("received message id=%d type=%s user=%s group=%s parts=%d", item.ID, msg.MessageType, msg.UserID, msg.GroupID, len(msg.Message))
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "id": item.ID})
+	}
 }
 
 func (s *appState) handleIndex(cfg appConfig) http.HandlerFunc {
@@ -200,8 +227,9 @@ func (s *appState) handleIndex(cfg appConfig) http.HandlerFunc {
 
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		if err := tmpl.Execute(w, map[string]any{
-			"Messages": messages,
-			"Onebot":   cfg.onebotBase,
+			"Messages":     messages,
+			"Onebot":       cfg.onebotBase,
+			"RepeatGroups": s.repeatGroupList(),
 		}); err != nil {
 			log.Printf("render index: %v", err)
 		}
@@ -258,6 +286,144 @@ func (s *appState) handleReply(cfg appConfig) http.HandlerFunc {
 
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 	}
+}
+
+func (s *appState) handleRepeatGroups(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	groupID := strings.TrimSpace(r.FormValue("group_id"))
+	action := strings.TrimSpace(r.FormValue("action"))
+	if groupID == "" {
+		http.Error(w, "group_id is required", http.StatusBadRequest)
+		return
+	}
+
+	s.repeatMu.Lock()
+	switch action {
+	case "remove":
+		delete(s.repeatGroups, groupID)
+		delete(s.repeatByGroup, groupID)
+	default:
+		s.repeatGroups[groupID] = struct{}{}
+	}
+	s.repeatMu.Unlock()
+
+	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
+func (s *appState) applyRepeatRule(cfg appConfig, msg wechatMessage) error {
+	groupID := strings.TrimSpace(msg.GroupID)
+	if chatType(msg) != "group" || groupID == "" {
+		return nil
+	}
+
+	userID := messageUserID(msg)
+	if userID == "" || userID == strings.TrimSpace(msg.SelfID) {
+		return nil
+	}
+
+	text := normalizeRepeatText(extractTextContent(msg))
+	if text == "" {
+		return nil
+	}
+
+	var shouldSend bool
+	s.repeatMu.Lock()
+	if _, ok := s.repeatGroups[groupID]; ok {
+		prev := s.repeatByGroup[groupID]
+		if prev.LastText != text {
+			prev.TriggeredText = ""
+		}
+		shouldSend = prev.LastText == text &&
+			prev.LastUserID != "" &&
+			prev.LastUserID != userID &&
+			prev.TriggeredText != text
+		if shouldSend {
+			prev.TriggeredText = text
+		}
+		prev.LastUserID = userID
+		prev.LastText = text
+		prev.LastMessageID = msg.MessageID
+		s.repeatByGroup[groupID] = prev
+	}
+	s.repeatMu.Unlock()
+
+	if !shouldSend {
+		return nil
+	}
+
+	log.Printf("repeat rule matched group=%s text=%q", groupID, text)
+	return sendGroupText(cfg.onebotBase, groupID, text)
+}
+
+func sendGroupText(onebotBase, groupID, text string) error {
+	return postOnebot(onebotBase, "/send_group_msg", sendRequest{
+		GroupID: groupID,
+		Message: []sendMessage{{
+			Type: "text",
+			Data: map[string]any{"text": text},
+		}},
+	})
+}
+
+func (s *appState) repeatGroupList() []string {
+	s.repeatMu.Lock()
+	defer s.repeatMu.Unlock()
+
+	groups := make([]string, 0, len(s.repeatGroups))
+	for groupID := range s.repeatGroups {
+		groups = append(groups, groupID)
+	}
+	sort.Strings(groups)
+	return groups
+}
+
+func parseGroupSet(raw string) map[string]struct{} {
+	groups := make(map[string]struct{})
+	for _, part := range strings.Split(raw, ",") {
+		groupID := strings.TrimSpace(part)
+		if groupID != "" {
+			groups[groupID] = struct{}{}
+		}
+	}
+	return groups
+}
+
+func extractTextContent(msg wechatMessage) string {
+	chunks := make([]string, 0, len(msg.Message))
+	for _, part := range msg.Message {
+		if part.Type == "text" {
+			if text := strings.TrimSpace(part.Data.Text); text != "" {
+				chunks = append(chunks, text)
+			}
+		}
+	}
+	if len(chunks) > 0 {
+		return strings.Join(chunks, "\n")
+	}
+	return msg.RawMessage
+}
+
+func normalizeRepeatText(text string) string {
+	lines := strings.Fields(strings.TrimSpace(text))
+	return strings.Join(lines, " ")
+}
+
+func messageUserID(msg wechatMessage) string {
+	if strings.TrimSpace(msg.UserID) != "" {
+		return strings.TrimSpace(msg.UserID)
+	}
+	if msg.Sender != nil {
+		return strings.TrimSpace(msg.Sender.UserID)
+	}
+	return ""
 }
 
 func postOnebot(base, endpoint string, req sendRequest) error {
@@ -507,6 +673,59 @@ const indexHTML = `<!doctype html>
       margin: 0 auto;
       padding: 18px;
     }
+    .rule-panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 14px 16px;
+      margin-bottom: 14px;
+      display: grid;
+      gap: 12px;
+    }
+    .rule-title {
+      margin: 0;
+      font-size: 16px;
+      font-weight: 700;
+    }
+    .rule-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+    }
+    .rule-form {
+      display: grid;
+      grid-template-columns: minmax(240px, 1fr) auto;
+      gap: 10px;
+    }
+    input[type="text"] {
+      width: 100%;
+      min-height: 42px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 9px 10px;
+      font: inherit;
+      background: #fff;
+      color: var(--text);
+    }
+    .inline-form {
+      display: inline;
+    }
+    .remove-btn {
+      min-height: 24px;
+      border-radius: 999px;
+      padding: 2px 8px;
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--muted);
+      border: 1px solid var(--line);
+      background: #fff;
+    }
+    .remove-btn:hover {
+      color: #fff;
+      border-color: var(--warn);
+      background: var(--warn);
+    }
     .empty {
       background: var(--panel);
       border: 1px solid var(--line);
@@ -686,6 +905,7 @@ const indexHTML = `<!doctype html>
     @media (max-width: 720px) {
       .bar, main { padding-left: 12px; padding-right: 12px; }
       .msg-head { grid-template-columns: 1fr; }
+      .rule-form { grid-template-columns: 1fr; }
       .time { white-space: normal; }
       form.reply { grid-template-columns: 1fr; }
       button { width: 100%; }
@@ -700,6 +920,30 @@ const indexHTML = `<!doctype html>
     </div>
   </header>
   <main>
+    <section class="rule-panel">
+      <h2 class="rule-title">额外监听群</h2>
+      <form class="rule-form" method="post" action="/repeat-groups">
+        <input type="text" name="group_id" placeholder="输入群ID，例如 53876528317@chatroom">
+        <button type="submit">添加监听</button>
+      </form>
+      <div class="rule-row">
+        {{if .RepeatGroups}}
+          {{range .RepeatGroups}}
+            <span class="badge">
+              {{.}}
+              <form class="inline-form" method="post" action="/repeat-groups">
+                <input type="hidden" name="action" value="remove">
+                <input type="hidden" name="group_id" value="{{.}}">
+                <button class="remove-btn" type="submit">移除</button>
+              </form>
+            </span>
+          {{end}}
+        {{else}}
+          <span class="badge">未设置监听群</span>
+        {{end}}
+      </div>
+      <div class="hint">同一个监听群里，连续两个不同微信ID发送相同文字时，自动向该群发送一次相同文字；同一段连续重复只触发一次。</div>
+    </section>
     {{if not .Messages}}
       <div class="empty">还没有收到消息</div>
     {{end}}
