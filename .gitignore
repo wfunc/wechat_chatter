@@ -1,4 +1,5 @@
 .idea
+.deps
 __handlers__
 *.sqlite
 .DS_Store
@@ -12,8 +13,11 @@ release
 onebot/audio
 onebot/image
 onebot/log
+log/
 .comate
 onebot/file
 onebot/videos
 .claude
-
+message_admin/message-admin
+message_admin/state.json
+state.json

@@ -76,6 +76,15 @@ func HandleProtobufMsg(payload map[string]interface{}) ([]byte, error) {
 	userContent := string(data.UserContent)
 	msgId := fmt.Sprintf("%d", data.MsgId)
 
+	if isConversationOpMessage(content) {
+		Info("忽略微信会话操作消息", "msg_id", msgId, "sender", sender, "receiver", receiver, "content", compactLogText(content, 160))
+		return nil, nil
+	}
+	if isSecuritySysMessage(content) {
+		Info("忽略微信安全控制消息", "msg_id", msgId, "sender", sender, "receiver", receiver, "content", compactLogText(content, 160))
+		return nil, nil
+	}
+
 	if sender == "" || receiver == "" || content == "" || msgId == "" || msgId == "0" {
 		return nil, fmt.Errorf("protobuf_msg: missing required fields sender=%s receiver=%s content_len=%d msgId=%s",
 			sender, receiver, len(content), msgId)
@@ -133,7 +142,12 @@ func HandleProtobufMsg(payload map[string]interface{}) ([]byte, error) {
 		}
 	}
 
-	myWechatId = selfId
+	if myWechatId == "" {
+		setMyWechatId(selfId)
+	}
+	if strings.Contains(selfId, "@chatroom") && myWechatId != "" {
+		selfId = myWechatId
+	}
 	if groupId != "" {
 		userID2NicknameMap.Store(groupId+"_"+senderUser, senderNickname)
 	}
@@ -235,4 +249,41 @@ func classifyMessage(content string, mediaContent []byte) *Message {
 	default:
 		return &Message{Type: "text", Data: &SendRequestData{Text: content}}
 	}
+}
+
+func isConversationOpMessage(content string) bool {
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return false
+	}
+	normalized := strings.ReplaceAll(content, "\n", "")
+	normalized = strings.ReplaceAll(normalized, "\t", "")
+	return strings.HasPrefix(normalized, "<msg><op ") &&
+		strings.Contains(normalized, "<name>lastMessage</name>") &&
+		strings.Contains(normalized, "<arg>") &&
+		strings.Contains(normalized, "messageSvrId")
+}
+
+func isSecuritySysMessage(content string) bool {
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return false
+	}
+	if idx := strings.Index(content, "<sysmsg"); idx >= 0 {
+		content = content[idx:]
+	}
+	normalized := strings.ReplaceAll(content, "\n", "")
+	normalized = strings.ReplaceAll(normalized, "\t", "")
+	normalized = strings.ReplaceAll(normalized, " ", "")
+	return (strings.HasPrefix(normalized, `<sysmsgtype="secmsg"`) || strings.HasPrefix(normalized, `<sysmsgtype='secmsg'`)) &&
+		strings.Contains(normalized, "<secmsg>") &&
+		strings.Contains(normalized, "<sec_msg_node>")
+}
+
+func compactLogText(text string, limit int) string {
+	text = strings.Join(strings.Fields(text), " ")
+	if limit <= 0 || len(text) <= limit {
+		return text
+	}
+	return text[:limit] + "..."
 }
