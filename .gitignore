@@ -13,6 +13,7 @@ release
 onebot/audio
 onebot/image
 onebot/log
+log/
 .comate
 onebot/file
 onebot/videos
