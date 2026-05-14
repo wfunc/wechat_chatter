@@ -143,17 +143,29 @@ type appMsgXML struct {
 		Title    string `xml:"title"`
 		Type     string `xml:"type"`
 		ReferMsg struct {
-			Content     string `xml:"content"`
-			CreateTime  int64  `xml:"createtime"`
-			DisplayName string `xml:"displayname"`
-			FromUser    string `xml:"fromusr"`
-			SvrID       string `xml:"svrid"`
-			MsgSource   string `xml:"msgsource"`
-			MsgType     string `xml:"type"`
-			ChatUser    string `xml:"chatusr"`
+			Content     xmlContent `xml:"content"`
+			CreateTime  int64      `xml:"createtime"`
+			DisplayName string     `xml:"displayname"`
+			FromUser    string     `xml:"fromusr"`
+			SvrID       string     `xml:"svrid"`
+			MsgSource   string     `xml:"msgsource"`
+			MsgType     string     `xml:"type"`
+			ChatUser    string     `xml:"chatusr"`
 		} `xml:"refermsg"`
 	} `xml:"appmsg"`
 	FromUsername string `xml:"fromusername"`
+}
+
+type xmlContent struct {
+	Text     string `xml:",chardata"`
+	InnerXML string `xml:",innerxml"`
+}
+
+func (c xmlContent) String() string {
+	if text := strings.TrimSpace(c.Text); text != "" {
+		return text
+	}
+	return strings.TrimSpace(c.InnerXML)
 }
 
 type sysMsgXML struct {
@@ -885,7 +897,7 @@ func quotedAppMessagePart(raw string) (displayPart, bool) {
 
 	ref := msg.AppMsg.ReferMsg
 	refName := strings.TrimSpace(ref.DisplayName)
-	refContent := strings.TrimSpace(ref.Content)
+	refContent := summarizeQuotedContent(ref.Content.String(), 0)
 	switch {
 	case refName != "" && refContent != "":
 		lines = append(lines, "引用 "+refName+"："+refContent)
@@ -929,6 +941,41 @@ func parseAppMessage(raw string) (appMsgXML, bool) {
 		return msg, false
 	}
 	return msg, strings.TrimSpace(msg.AppMsg.Type) != ""
+}
+
+func summarizeQuotedContent(raw string, depth int) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	if depth > 3 {
+		return firstNonEmpty(stripXMLText(raw), raw)
+	}
+
+	if msg, ok := parseAppMessage(raw); ok {
+		title := strings.TrimSpace(msg.AppMsg.Title)
+		ref := msg.AppMsg.ReferMsg
+		refName := strings.TrimSpace(ref.DisplayName)
+		refContent := summarizeQuotedContent(ref.Content.String(), depth+1)
+
+		switch {
+		case title != "" && refName != "" && refContent != "":
+			return title + "（引用 " + refName + "：" + refContent + "）"
+		case title != "" && refContent != "":
+			return title + "（引用：" + refContent + "）"
+		case title != "":
+			return title
+		case refName != "" && refContent != "":
+			return "引用 " + refName + "：" + refContent
+		case refContent != "":
+			return refContent
+		}
+	}
+
+	if strings.HasPrefix(raw, "<") || strings.Contains(raw, "<msg") || strings.Contains(raw, "<appmsg") {
+		return firstNonEmpty(stripXMLText(raw), raw)
+	}
+	return raw
 }
 
 func sysMessageTitle(raw string) string {

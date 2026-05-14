@@ -28,3 +28,27 @@ func TestQuotedAppMessagePart(t *testing.T) {
 		}
 	}
 }
+
+func TestQuotedAppMessagePartNestedQuote(t *testing.T) {
+	inner := `<msg><appmsg appid="" sdkver="0"><title>是</title><des></des><action></action><type>57</type><showtype>0</showtype><soundtype>0</soundtype><mediatagname></mediatagname><messageext></messageext><messageaction></messageaction><content></content><contentattr>0</contentattr><url></url><lowurl></lowurl><dataurl></dataurl><lowdataurl></lowdataurl><songalbumurl></songalbumurl><songlyric></songlyric><template_id></template_id><appattach><totallen>0</totallen><attachid></attachid><emoticonmd5></emoticonmd5><fileext></fileext><aeskey></aeskey></appattach><extinfo></extinfo><sourceusername></sourceusername><sourcedisplayname></sourcedisplayname><thumburl></thumburl><md5></md5><statextstr></statextstr></appmsg><fromusername></fromusername><appinfo><version>0</version><appname></appname></appinfo><isforceupdate>0</isforceupdate></msg>`
+	raw := `<?xml version="1.0"?><msg><appmsg appid="" sdkver="0"><title>对</title><des /><action /><type>57</type><refermsg><content>` + inner + `</content><displayname>🐮🍃 besos</displayname><fromusr>49361126693@chatroom</fromusr><svrid>4345609589109649987</svrid><type>57</type><chatusr>wxid_vn2w1t3doieu22</chatusr></refermsg></appmsg><fromusername>wxid_84x7t9cb9erc22</fromusername></msg>`
+
+	part, ok := quotedAppMessagePart(raw)
+	if !ok {
+		t.Fatal("quotedAppMessagePart() did not parse nested type=57 appmsg")
+	}
+	if strings.Contains(part.Text, "<appmsg") || strings.Contains(part.Text, "<msg>") {
+		t.Fatalf("nested XML leaked into display text:\n%s", part.Text)
+	}
+	for _, want := range []string{
+		"对",
+		"引用 🐮🍃 besos：是",
+		"原发送人=wxid_vn2w1t3doieu22",
+		"原会话=49361126693@chatroom",
+		"发送人=wxid_84x7t9cb9erc22",
+	} {
+		if !strings.Contains(part.Text, want) {
+			t.Fatalf("part.Text missing %q:\n%s", want, part.Text)
+		}
+	}
+}
