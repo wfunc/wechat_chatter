@@ -7,18 +7,18 @@ func TestSetMyWechatIdRejectsChatroom(t *testing.T) {
 	defer func() { myWechatId = old }()
 
 	myWechatId = ""
-	setMyWechatId("49361126693@chatroom")
+	setMyWechatId("10000000002@chatroom")
 	if myWechatId != "" {
 		t.Fatalf("chatroom id should not set myWechatId, got %q", myWechatId)
 	}
 
-	setMyWechatId("wxid_vn2w1t3doieu22")
-	if myWechatId != "wxid_vn2w1t3doieu22" {
+	setMyWechatId("wxid_self_example")
+	if myWechatId != "wxid_self_example" {
 		t.Fatalf("myWechatId = %q", myWechatId)
 	}
 
-	setMyWechatId("49361126693@chatroom")
-	if myWechatId != "wxid_vn2w1t3doieu22" {
+	setMyWechatId("10000000002@chatroom")
+	if myWechatId != "wxid_self_example" {
 		t.Fatalf("chatroom id overwrote myWechatId: %q", myWechatId)
 	}
 	if !validMyWechatId() {
@@ -31,8 +31,8 @@ func TestInferMyWechatIdFromImagePath(t *testing.T) {
 	defer func() { myWechatId = old }()
 
 	myWechatId = ""
-	inferMyWechatIdFromImagePath("/Users/mini/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files/wxid_vn2w1t3doieu22_f851/temp/abc/2026-05/Img")
-	if myWechatId != "wxid_vn2w1t3doieu22" {
+	inferMyWechatIdFromImagePath("/Users/example/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files/wxid_self_example_abcd/temp/example/2026-05/Img")
+	if myWechatId != "wxid_self_example" {
 		t.Fatalf("myWechatId = %q", myWechatId)
 	}
 }

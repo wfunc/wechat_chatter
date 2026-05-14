@@ -1966,7 +1966,7 @@ const indexHTML = `<!doctype html>
     <section class="rule-panel">
       <h2 class="rule-title">额外监听群</h2>
       <form class="rule-form" method="post" action="/repeat-groups">
-        <input type="text" name="group_id" placeholder="输入群ID，例如 53876528317@chatroom">
+        <input type="text" name="group_id" placeholder="输入群ID，例如 10000000001@chatroom">
         <button type="submit">添加监听</button>
       </form>
       <div class="rule-row">
@@ -2014,7 +2014,7 @@ const indexHTML = `<!doctype html>
     <section class="rule-panel">
       <h2 class="rule-title">群名设置</h2>
       <form class="rule-form" method="post" action="/group-names">
-        <input type="text" name="group_id" placeholder="群ID，例如 48809018751@chatroom">
+        <input type="text" name="group_id" placeholder="群ID，例如 10000000004@chatroom">
         <input type="text" name="group_name" placeholder="要显示的群名">
         <button type="submit">保存群名</button>
       </form>

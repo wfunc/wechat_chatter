@@ -3,7 +3,7 @@ package main
 import "testing"
 
 func TestIsConversationOpMessage(t *testing.T) {
-	content := `<msg><op id='2'><username>53876528317@chatroom</username><name>lastMessage</name><arg>{"messageSvrId":2662912407889658702,"MsgCreateTime":1778744718}</arg></op></msg>`
+	content := `<msg><op id='2'><username>10000000001@chatroom</username><name>lastMessage</name><arg>{"messageSvrId":2662912407889658702,"MsgCreateTime":1778744718}</arg></op></msg>`
 	if !isConversationOpMessage(content) {
 		t.Fatal("expected lastMessage op to be detected")
 	}
@@ -21,7 +21,7 @@ func TestIsConversationOpMessageRejectsChatText(t *testing.T) {
 func TestIsSecuritySysMessage(t *testing.T) {
 	content := `<sysmsg type="secmsg">
   <secmsg>
-    <session>57066484707@chatroom</session>
+    <session>10000000003@chatroom</session>
     <newmsgid>1187626774747965624</newmsgid>
     <sec_msg_node>
       <show-h5></show-h5>
