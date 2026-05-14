@@ -80,3 +80,20 @@ func TestRevokeMessageTextIncludesOriginalContent(t *testing.T) {
 		}
 	}
 }
+
+func TestBroadcastEvent(t *testing.T) {
+	state := &appState{eventClients: make(map[chan string]struct{})}
+	events := make(chan string, 1)
+	state.addEventClient(events)
+	defer state.removeEventClient(events)
+
+	state.broadcastEvent("message")
+	select {
+	case got := <-events:
+		if got != "message" {
+			t.Fatalf("event = %q", got)
+		}
+	default:
+		t.Fatal("expected event to be delivered")
+	}
+}

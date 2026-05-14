@@ -86,6 +86,8 @@ type appState struct {
 	hiddenTargets map[string]hiddenTarget
 	groupNameMu   sync.RWMutex
 	groupNames    map[string]string
+	eventMu       sync.Mutex
+	eventClients  map[chan string]struct{}
 }
 
 type repeatState struct {
@@ -223,6 +225,7 @@ func main() {
 		repeatByGroup: make(map[string]repeatState),
 		hiddenTargets: make(map[string]hiddenTarget),
 		groupNames:    make(map[string]string),
+		eventClients:  make(map[chan string]struct{}),
 	}
 	if err := state.loadState(); err != nil {
 		log.Printf("load state failed path=%s err=%v", cfg.statePath, err)
@@ -231,6 +234,7 @@ func main() {
 	mux.HandleFunc("/", state.handleIndex(cfg))
 	mux.HandleFunc("/onebot", state.handleOnebot(cfg))
 	mux.HandleFunc("/api/messages", state.handleMessages)
+	mux.HandleFunc("/events", state.handleEvents)
 	mux.HandleFunc("/reply", state.handleReply(cfg))
 	mux.HandleFunc("/repeat-groups", state.handleRepeatGroups)
 	mux.HandleFunc("/display-targets", state.handleDisplayTargets)
@@ -299,6 +303,7 @@ func (s *appState) handleOnebot(cfg appConfig) http.HandlerFunc {
 			log.Printf("received hidden message type=%s user=%s group=%s parts=%d", msg.MessageType, msg.UserID, msg.GroupID, len(msg.Message))
 		} else {
 			log.Printf("received message id=%d type=%s user=%s group=%s parts=%d", itemID, msg.MessageType, msg.UserID, msg.GroupID, len(msg.Message))
+			s.broadcastEvent("message")
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "id": itemID, "hidden": hidden})
@@ -350,6 +355,41 @@ func (s *appState) handleMessages(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(messages)
+}
+
+func (s *appState) handleEvents(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+
+	events := make(chan string, 8)
+	s.addEventClient(events)
+	defer s.removeEventClient(events)
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	_, _ = fmt.Fprint(w, ": connected\n\n")
+	flusher.Flush()
+
+	heartbeat := time.NewTicker(25 * time.Second)
+	defer heartbeat.Stop()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case event := <-events:
+			_, _ = fmt.Fprintf(w, "event: %s\ndata: %d\n\n", event, time.Now().UnixMilli())
+			flusher.Flush()
+		case <-heartbeat.C:
+			_, _ = fmt.Fprint(w, ": heartbeat\n\n")
+			flusher.Flush()
+		}
+	}
 }
 
 func (s *appState) handleReply(cfg appConfig) http.HandlerFunc {
@@ -681,6 +721,32 @@ func (s *appState) indexMessageLocked(item storedMessage) {
 		s.messageByID = make(map[string]storedMessage)
 	}
 	s.messageByID[msgID] = item
+}
+
+func (s *appState) addEventClient(events chan string) {
+	s.eventMu.Lock()
+	if s.eventClients == nil {
+		s.eventClients = make(map[chan string]struct{})
+	}
+	s.eventClients[events] = struct{}{}
+	s.eventMu.Unlock()
+}
+
+func (s *appState) removeEventClient(events chan string) {
+	s.eventMu.Lock()
+	delete(s.eventClients, events)
+	s.eventMu.Unlock()
+}
+
+func (s *appState) broadcastEvent(event string) {
+	s.eventMu.Lock()
+	for events := range s.eventClients {
+		select {
+		case events <- event:
+		default:
+		}
+	}
+	s.eventMu.Unlock()
 }
 
 func (s *appState) hiddenTargetList() []hiddenTarget {
@@ -1791,6 +1857,17 @@ const indexHTML = `<!doctype html>
   </div>
   <script>
     (function () {
+      if (window.EventSource) {
+        var source = new EventSource('/events');
+        var reloadTimer = null;
+        source.addEventListener('message', function () {
+          if (reloadTimer) return;
+          reloadTimer = window.setTimeout(function () {
+            window.location.reload();
+          }, 350);
+        });
+      }
+
       var box = document.getElementById('imageLightbox');
       if (!box) return;
       var img = box.querySelector('img');
