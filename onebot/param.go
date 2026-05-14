@@ -3,7 +3,7 @@ package main
 import (
 	"encoding/xml"
 	"sync"
-	
+
 	"github.com/frida/frida-go/frida"
 )
 
@@ -14,12 +14,12 @@ var (
 	device      frida.DeviceInt
 	taskId      = int64(0x20000000)
 	myWechatId  = ""
-	
+
 	msgChan    = make(chan *SendMsg, 100)
 	finishChan = make(chan struct{}, 100)
-	
+
 	config = &Config{}
-	
+
 	userID2NicknameMap sync.Map
 	userID2FileMsgMap  sync.Map
 	videoInfoMap       sync.Map // targetId -> *VideoInfo
@@ -91,13 +91,13 @@ type Message struct {
 }
 
 type SendRequestData struct {
-	Id           string          `json:"id,omitempty"`
-	Text         string          `json:"text,omitempty"`
-	File         string          `json:"file,omitempty"`
-	URL          string          `json:"url,omitempty"`
-	QQ           string          `json:"qq,omitempty"`
-	Media        []byte          `json:"media,omitempty"`
-	ReplyMessage *WechatMessage  `json:"reply_message,omitempty"`
+	Id           string         `json:"id,omitempty"`
+	Text         string         `json:"text,omitempty"`
+	File         string         `json:"file,omitempty"`
+	URL          string         `json:"url,omitempty"`
+	QQ           string         `json:"qq,omitempty"`
+	Media        []byte         `json:"media,omitempty"`
+	ReplyMessage *WechatMessage `json:"reply_message,omitempty"`
 }
 
 type Config struct {
@@ -112,6 +112,7 @@ type Config struct {
 	WechatPid       int    `json:"wechat_pid"`
 
 	WechatConf string `json:"wechat_conf"`
+	WechatApp  string `json:"wechat_app"`
 }
 
 // VoiceMsg 对应外层的 <msg> 标签
@@ -163,7 +164,7 @@ type Image struct {
 	HDHeight    int    `xml:"cdnhdheight,attr"`
 	HDWidth     int    `xml:"cdnhdwidth,attr"`
 	MidImgURL   string `xml:"cdnmidimgurl,attr"`
-	
+
 	// 子节点
 	SecHashInfo string `xml:"secHashInfoBase64"`
 	Live        Live   `xml:"live"`

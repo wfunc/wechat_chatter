@@ -9,6 +9,7 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime/debug"
 	"strings"
 	"syscall"
@@ -61,6 +62,7 @@ func initFlag() {
 	flag.StringVar(&config.OnebotToken, "token", "MuseBot", "OneBot Token: MuseBot")
 	flag.StringVar(&config.ImagePath, "image_path", "", "图片路径: /Users/xxx/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files/xxx/temp/xxx/2026-01/Img/")
 	flag.StringVar(&config.WechatConf, "wechat_conf", "../wechat_version/4_1_9_52_mac.json", "微信配置文件路径: ../wechat_version/4_1_6_12_mac.json")
+	flag.StringVar(&config.WechatApp, "wechat_app", "", "微信应用路径关键字: WeChat.app | 微信BOT.app；不设置则自动选择第一个 WeChat 进程")
 	flag.StringVar(&config.ConnType, "conn_type", "http", "连接类型: http | websocket")
 	flag.IntVar(&config.SendInterval, "send_interval", 1000, "发送间隔: ms")
 	flag.IntVar(&config.WechatPid, "wechat_pid", 0, "微信进程 PID，不设置则自动查找")
@@ -75,6 +77,7 @@ func initFlag() {
 	fmt.Println("OnebotToken", config.OnebotToken)
 	fmt.Println("ImagePath", config.ImagePath)
 	fmt.Println("WechatConf", config.WechatConf)
+	fmt.Println("WechatApp", config.WechatApp)
 	fmt.Println("ConnType", config.ConnType)
 	fmt.Println("SendInterval", config.SendInterval)
 	fmt.Println("WechatPid", config.WechatPid)
@@ -82,21 +85,70 @@ func initFlag() {
 }
 
 func initFridaGadget() {
+	for {
+		if tryInitFridaGadget() {
+			return
+		}
+		time.Sleep(5 * time.Second)
+	}
+}
+
+func tryInitFridaGadget() bool {
 	var err error
 	mgr := frida.NewDeviceManager()
 	// 连接到 Gadget 默认端口
 	device, err = mgr.AddRemoteDevice(config.FridaGadgetAddr, frida.NewRemoteDeviceOptions())
 	if err != nil {
-		Fatal("❌ 无法连接 Gadget", err)
+		Warn("无法连接 Gadget，5秒后重试", "err", err, "addr", config.FridaGadgetAddr)
+		return false
 	}
 
-	session, err = device.Attach("Gadget", nil)
+	target, err := findGadgetAttachTarget(device)
 	if err != nil {
-		Fatal("❌ 附加失败", err)
+		Warn("查找 Gadget 进程失败，5秒后重试", "err", err)
+		return false
+	}
+	Info("准备 Attach Gadget 进程", "target", target)
+
+	session, err = device.Attach(target, nil)
+	if err != nil {
+		Warn("附加 Gadget 失败，5秒后重试", "err", err, "target", target, "remote_processes", describeGadgetProcesses(device))
+		return false
 	}
 
+	Info("成功 Attach Gadget 进程", "target", target)
 	loadJs()
+	return true
+}
 
+func findGadgetAttachTarget(device frida.DeviceInt) (interface{}, error) {
+	if config.WechatPid > 0 {
+		return config.WechatPid, nil
+	}
+
+	// Frida Gadget listen mode is attached by process name. Some Gadget builds do
+	// not support remote process enumeration before attach, so avoid making that
+	// a hard dependency.
+	return "Gadget", nil
+}
+
+func describeGadgetProcesses(device frida.DeviceInt) string {
+	processes, err := device.EnumerateProcesses(frida.ScopeMinimal)
+	if err != nil {
+		return fmt.Sprintf("无法枚举远端进程: %v", err)
+	}
+	if len(processes) == 0 {
+		return "Gadget 设备没有暴露任何进程"
+	}
+
+	names := make([]string, 0, len(processes))
+	for _, proc := range processes {
+		name := proc.Name()
+		pid := proc.PID()
+		names = append(names, fmt.Sprintf("%s(%d)", name, pid))
+	}
+
+	return strings.Join(names, ", ")
 }
 
 func initFrida() {
@@ -142,20 +194,28 @@ func attachWechat() {
 }
 
 func loadJs() {
-	jsonData, err := os.ReadFile(config.WechatConf)
+	wechatConfPath, err := resolveRuntimePath(config.WechatConf)
 	if err != nil {
-		Fatal("读取文件失败", "err", err)
+		Fatal("解析微信配置路径失败", "err", err, "path", config.WechatConf)
+	}
+	jsonData, err := os.ReadFile(wechatConfPath)
+	if err != nil {
+		Fatal("读取文件失败", "err", err, "path", wechatConfPath)
 	}
 
 	// 2. 将 JSON 解析为 Map
 	var wechatHookConf map[string]interface{}
 	if err = json.Unmarshal(jsonData, &wechatHookConf); err != nil {
-		Fatal("解析 JSON 失败", "err", err)
+		Fatal("解析 JSON 失败", "err", err, "path", wechatConfPath)
 	}
 
-	codeTemplate, err := os.ReadFile("./script.js")
+	scriptPath, err := resolveRuntimePath("./script.js")
 	if err != nil {
-		Fatal("读取脚本失败", "err", err)
+		Fatal("解析脚本路径失败", "err", err)
+	}
+	codeTemplate, err := os.ReadFile(scriptPath)
+	if err != nil {
+		Fatal("读取脚本失败", "err", err, "path", scriptPath)
 	}
 
 	tmpl, err := template.New("fridaScript").Parse(string(codeTemplate))
@@ -278,9 +338,39 @@ func loadJs() {
 	})
 
 	if err := script.Load(); err != nil {
-		Fatal("❌ 加载脚本失败", err)
+		Fatal("❌ 加载脚本失败", "err", err)
 	}
 
 	fridaScript = script
-	Info("✅ Frida 已就绪，微信控制通道已打通")
+	Info("✅ Frida 已就绪，微信控制通道已打通", "wechat_conf", wechatConfPath, "script", scriptPath)
+}
+
+func resolveRuntimePath(path string) (string, error) {
+	if filepath.IsAbs(path) {
+		return path, nil
+	}
+	if _, err := os.Stat(path); err == nil {
+		return path, nil
+	}
+
+	exePath, err := os.Executable()
+	if err != nil {
+		return "", err
+	}
+	exeDir := filepath.Dir(exePath)
+	candidates := []string{
+		filepath.Join(exeDir, path),
+		filepath.Join(exeDir, "..", path),
+	}
+	if filepath.Base(exeDir) == "onebot" {
+		candidates = append(candidates, filepath.Join(filepath.Dir(exeDir), path))
+	}
+
+	for _, candidate := range candidates {
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate, nil
+		}
+	}
+
+	return path, nil
 }

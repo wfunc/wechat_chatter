@@ -155,7 +155,7 @@ func SendHttpReq(jsonData []byte) {
 	// 6. 执行请求
 	resp, err := client.Do(req)
 	if err != nil {
-		Error("请求执行失败", "err", err)
+		Error("请求执行失败", "err", err, "url", config.SendURL)
 		return
 	}
 	defer resp.Body.Close()

@@ -315,13 +315,48 @@ func SaveImageToFile(ext string, data []byte) (string, error) {
 }
 
 func GetWeChatPID() (int, error) {
-	cmd := exec.Command("pgrep", "-x", "WeChat")
+	cmd := exec.Command("ps", "-axo", "pid=,args=")
 	output, err := cmd.Output()
 	if err != nil {
 		return 0, fmt.Errorf("未发现正在运行的微信进程")
 	}
 
-	return strconv.Atoi(strings.TrimSpace(string(output)))
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	appexCandidates := make([]string, 0, len(lines))
+	wechatCandidates := make([]string, 0, len(lines))
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if config.WechatApp != "" && !strings.Contains(line, config.WechatApp) {
+			continue
+		}
+		if strings.Contains(line, "/WeChatAppEx.app/Contents/MacOS/WeChatAppEx") && !strings.Contains(line, " --type=") {
+			appexCandidates = append(appexCandidates, line)
+			continue
+		}
+		if strings.Contains(line, "/Contents/MacOS/WeChat") && !strings.Contains(line, "WeChatAppEx") {
+			wechatCandidates = append(wechatCandidates, line)
+		}
+	}
+	candidates := appexCandidates
+	if len(candidates) == 0 {
+		candidates = wechatCandidates
+	}
+	if len(candidates) == 0 {
+		if config.WechatApp != "" {
+			return 0, fmt.Errorf("未找到匹配 -wechat_app=%s 的微信进程", config.WechatApp)
+		}
+		return 0, fmt.Errorf("未发现正在运行的微信进程")
+	}
+	if len(candidates) > 1 {
+		Warn("发现多个微信主进程，默认选择第一个；可用 -wechat_pid 或 -wechat_app 指定", "processes", strings.Join(candidates, " | "))
+	}
+	Info("选择微信进程", "process", candidates[0])
+
+	fields := strings.Fields(candidates[0])
+	return strconv.Atoi(fields[0])
 }
 
 func DownloadFile(urlStr string) ([]byte, error) {

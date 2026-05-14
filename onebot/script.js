@@ -1,11 +1,100 @@
-var targetPath = "/Applications/WeChat.app/Contents/Resources/wechat.dylib";
-var module = Process.enumerateModules().find(function(m) {
-    return m.path === targetPath;
-});
-const baseAddr = module.base;
-if (!baseAddr) {
-    console.error("[!] 找不到 WeChat 模块基址，请检查进程名。");
+const requiredOffsets = [
+    {{.textCallbackFuncAddr}},
+    {{.sendMessageCallbackFunc}},
+    {{.sendFuncAddr}},
+    {{.req2bufEnterAddr}},
+    {{.req2bufExitAddr}},
+    {{.imageCallbackFuncAddr}},
+    {{.imgMessageCallbackFunc}},
+    {{.uploadImageAddr}},
+    {{.cndOnCompleteAddr}},
+    {{.buf2RespAddr}},
+    {{.uploadGetCallbackWrapperAddr}},
+    {{.uploadGetCallbackWrapperFuncAddr}},
+    {{.uploadOnCompleteAddr}},
+    {{.uploadOnCompleteFuncAddr}},
+    {{.startDownloadMedia}},
+    {{.downloadImagAddr}},
+    {{.downloadFileAddr}},
+    {{.downloadVideoAddr}},
+    {{.videoCallbackFuncAddr}},
+    {{.videoMessageCallbackFunc}},
+    {{.replyCallbackFuncAddr}},
+    {{.replyMessageCallbackFunc}}
+];
+const requiredMaxOffset = requiredOffsets.reduce(function(max, offset) {
+    return offset > max ? offset : max;
+}, 0);
+
+function chooseWechatModule() {
+    const modules = Process.enumerateModules();
+    const targetPaths = [
+        "/Applications/WeChat.app/Contents/Resources/wechat.dylib",
+        "/Applications/微信BOT.app/Contents/Resources/wechat.dylib",
+        "/Applications/微信ONEBOT.app/Contents/Resources/wechat.dylib"
+    ];
+    for (const targetPath of targetPaths) {
+        const exact = modules.find(function(m) {
+            return m.path === targetPath;
+        });
+        if (exact) {
+            return exact;
+        }
+    }
+
+    const candidates = modules.filter(function(m) {
+        const name = (m.name || "").toLowerCase();
+        const path = (m.path || "").toLowerCase();
+        const isWechatModule =
+            name === "wechat" ||
+            name === "wechat.dylib" ||
+            name === "wechappex framework" ||
+            path.indexOf("/applications/wechat.app/") !== -1 ||
+            path.indexOf("/applications/微信bot.app/") !== -1 ||
+            path.indexOf("/com.tencent.xinwechat/") !== -1;
+        return isWechatModule && m.size > requiredMaxOffset;
+    });
+
+    candidates.sort(function(a, b) {
+		function score(m) {
+			const name = (m.name || "").toLowerCase();
+			const path = (m.path || "").toLowerCase();
+            if (path.indexOf("/xplugin/plugins/") !== -1 && path.endsWith("/wechat.dylib")) {
+                return 100;
+            }
+            if (path.endsWith("/resources/wechat.dylib") || path.endsWith("/contents/frameworks/wechat.dylib")) {
+                return 120;
+            }
+            if (name === "wechappex framework" || path.indexOf("wechappex framework.framework") !== -1) {
+                return 60;
+            }
+			if (name === "wechat") {
+				return 40;
+			}
+            return 0;
+        }
+        return score(b) - score(a);
+    });
+
+    if (candidates.length > 0) {
+        return candidates[0];
+    }
+
+    const summary = modules
+        .filter(function(m) {
+            const path = (m.path || "").toLowerCase();
+            return path.indexOf("wechat") !== -1;
+        })
+        .map(function(m) {
+            return m.name + " size=0x" + m.size.toString(16) + " path=" + m.path;
+        })
+        .join("\n");
+    throw new Error("找不到可用的 WeChat 主模块，requiredMaxOffset=0x" + requiredMaxOffset.toString(16) + "\n候选模块:\n" + summary);
 }
+
+const module = chooseWechatModule();
+const baseAddr = module.base;
+console.log("[+] WeChat module: " + module.name + " size=0x" + module.size.toString(16) + " path=" + module.path);
 console.log("[+] WeChat base address: " + baseAddr);
 
 // -------------------------基础函数分区-------------------------
@@ -1029,6 +1118,9 @@ rpc.exports = {
 // -------------------------发送图片消息分区-------------------------
 
 // -------------------------接收消息分区-------------------------
+var receiveHitCount = 0;
+var receiveFilteredCount = 0;
+
 function setupDownloadFileDynamic() {
     downloadFileX1 = Memory.alloc(1624)
     fileIdAddr = Memory.alloc(128)
@@ -1042,10 +1134,16 @@ function setupDownloadFileDynamic() {
 setImmediate(setupDownloadFileDynamic)
 
 function setReceiver() {
+    console.log("[+] Receiver hook installing. buf2RespAddr=" + buf2RespAddr + " startDownloadMedia=" + startDownloadMedia);
     Interceptor.attach(buf2RespAddr, {
         onEnter: function (args) {
             const currentPtr = this.context.x20;
-            if (currentPtr.add(0).readU8() !== 0x08) {
+            const firstByte = currentPtr.add(0).readU8();
+            if (firstByte !== 0x08) {
+                receiveFilteredCount++;
+                if (receiveFilteredCount <= 5 || receiveFilteredCount % 100 === 0) {
+                    console.log("[recv] filtered by first byte: 0x" + firstByte.toString(16) + " count=" + receiveFilteredCount);
+                }
                 return
             }
 
@@ -1060,13 +1158,21 @@ function setReceiver() {
             // 过滤非聊天消息:
             // 1. field 2 是 varint (tag=0x10) 而非嵌套 message (tag=0x12) → 同步/通知消息
             // 2. field 2 wrapper长度 < 128 (单字节varint) → wrapper内容过小,非聊天消息
-            if (currentPtr.add(2).readU8() === 0x10 || currentPtr.add(2).readU8() === 0x16 || (currentPtr.add(3).readU8() & 0x80) === 0) {
+            const tag2 = currentPtr.add(2).readU8();
+            const tag3 = currentPtr.add(3).readU8();
+            if (tag2 === 0x10 || tag2 === 0x16 || (tag3 & 0x80) === 0) {
+                receiveFilteredCount++;
+                if (receiveFilteredCount <= 5 || receiveFilteredCount % 100 === 0) {
+                    console.log("[recv] filtered by wrapper tag: tag2=0x" + tag2.toString(16) + " tag3=0x" + tag3.toString(16) + " len=" + x2 + " count=" + receiveFilteredCount);
+                }
                 return;
             }
 
             const mem = currentPtr.readByteArray(x2);
             if (!mem) return;
             const uint8Array = new Uint8Array(mem);
+            receiveHitCount++;
+            console.log("[recv] protobuf_msg captured len=" + x2 + " count=" + receiveHitCount);
 
             send({
                 type: "protobuf_msg",
