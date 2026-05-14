@@ -76,6 +76,7 @@ type appState struct {
 	mu            sync.RWMutex
 	nextID        int64
 	messages      []storedMessage
+	messageByID   map[string]storedMessage
 	maxItems      int
 	statePath     string
 	repeatMu      sync.Mutex
@@ -172,6 +173,14 @@ type sysMsgXML struct {
 	Type                 string            `xml:"type,attr"`
 	DelChatRoomMember    sysMemberEventXML `xml:"delchatroommember"`
 	InviteChatRoomMember sysMemberEventXML `xml:"invitechatroommember"`
+	RevokeMsg            revokeMsgXML      `xml:"revokemsg"`
+}
+
+type revokeMsgXML struct {
+	Session    string `xml:"session"`
+	MsgID      string `xml:"msgid"`
+	NewMsgID   string `xml:"newmsgid"`
+	ReplaceMsg string `xml:"replacemsg"`
 }
 
 type sysMemberEventXML struct {
@@ -208,6 +217,7 @@ func main() {
 
 	state := &appState{
 		maxItems:      cfg.maxMessages,
+		messageByID:   make(map[string]storedMessage),
 		statePath:     cfg.statePath,
 		repeatGroups:  parseGroupSet(repeatGroups),
 		repeatByGroup: make(map[string]repeatState),
@@ -268,13 +278,17 @@ func (s *appState) handleOnebot(cfg appConfig) http.HandlerFunc {
 				RawJSON:    string(body),
 				Wechat:     msg,
 			}
-			item.DisplayParts = buildDisplayParts(msg)
 
 			s.mu.Lock()
+			item.DisplayParts = s.buildDisplayParts(msg)
 			s.nextID++
 			item.ID = s.nextID
 			s.messages = append([]storedMessage{item}, s.messages...)
+			s.indexMessageLocked(item)
 			if s.maxItems > 0 && len(s.messages) > s.maxItems {
+				for _, removed := range s.messages[s.maxItems:] {
+					delete(s.messageByID, removed.Wechat.MessageID)
+				}
 				s.messages = s.messages[:s.maxItems]
 			}
 			s.mu.Unlock()
@@ -650,11 +664,23 @@ func (s *appState) removeDisplayedTarget(kind, target string) {
 	filtered := s.messages[:0]
 	for _, msg := range s.messages {
 		if chatType(msg.Wechat) == kind && targetID(msg.Wechat) == target {
+			delete(s.messageByID, msg.Wechat.MessageID)
 			continue
 		}
 		filtered = append(filtered, msg)
 	}
 	s.messages = filtered
+}
+
+func (s *appState) indexMessageLocked(item storedMessage) {
+	msgID := strings.TrimSpace(item.Wechat.MessageID)
+	if msgID == "" {
+		return
+	}
+	if s.messageByID == nil {
+		s.messageByID = make(map[string]storedMessage)
+	}
+	s.messageByID[msgID] = item
 }
 
 func (s *appState) hiddenTargetList() []hiddenTarget {
@@ -850,6 +876,10 @@ func postOnebot(base, endpoint string, req sendRequest) error {
 }
 
 func buildDisplayParts(msg wechatMessage) []displayPart {
+	return (*appState)(nil).buildDisplayParts(msg)
+}
+
+func (s *appState) buildDisplayParts(msg wechatMessage) []displayPart {
 	parts := make([]displayPart, 0, len(msg.Message))
 	for _, part := range msg.Message {
 		data := part.Data
@@ -868,7 +898,7 @@ func buildDisplayParts(msg wechatMessage) []displayPart {
 		case "at":
 			parts = append(parts, displayPart{Type: "text", Text: "@" + data.QQ})
 		case "sys":
-			parts = append(parts, displayPart{Type: "sys", Text: sysMessageText(data.Text), Title: sysMessageTitle(data.Text)})
+			parts = append(parts, displayPart{Type: "sys", Text: s.sysMessageText(data.Text), Title: sysMessageTitle(data.Text)})
 		default:
 			text := firstNonEmpty(data.Text, data.File, data.URL)
 			if quote, ok := quotedAppMessagePart(text); ok {
@@ -985,6 +1015,8 @@ func sysMessageTitle(raw string) string {
 	}
 
 	switch msg.Type {
+	case "revokemsg":
+		return "系统消息：撤回消息"
 	case "delchatroommember":
 		scene := strings.TrimSpace(msg.DelChatRoomMember.Link.Scene)
 		switch scene {
@@ -1008,9 +1040,17 @@ func sysMessageTitle(raw string) string {
 }
 
 func sysMessageText(raw string) string {
+	return (*appState)(nil).sysMessageText(raw)
+}
+
+func (s *appState) sysMessageText(raw string) string {
 	msg, ok := parseSysMessage(raw)
 	if !ok {
 		return firstNonEmpty(stripXMLText(raw), raw)
+	}
+
+	if msg.Type == "revokemsg" {
+		return s.revokeMessageText(msg, raw)
 	}
 
 	event := msg.DelChatRoomMember
@@ -1025,6 +1065,67 @@ func sysMessageText(raw string) string {
 		text += "\n场景：" + scene
 	}
 	return text
+}
+
+func (s *appState) revokeMessageText(msg sysMsgXML, raw string) string {
+	rev := msg.RevokeMsg
+	lines := make([]string, 0, 5)
+	if text := strings.TrimSpace(rev.ReplaceMsg); text != "" {
+		lines = append(lines, text)
+	}
+	if rev.Session != "" {
+		lines = append(lines, "会话："+rev.Session)
+	}
+	if rev.NewMsgID != "" {
+		lines = append(lines, "原消息ID："+rev.NewMsgID)
+	}
+	if content := s.recalledMessageContent(rev.NewMsgID); content != "" {
+		lines = append(lines, "撤回内容："+content)
+	}
+	if len(lines) == 0 {
+		lines = append(lines, firstNonEmpty(stripXMLText(raw), raw))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (s *appState) recalledMessageContent(messageID string) string {
+	messageID = strings.TrimSpace(messageID)
+	if s == nil || messageID == "" {
+		return ""
+	}
+	item, ok := s.messageByID[messageID]
+	if !ok {
+		return ""
+	}
+	return summarizeStoredMessage(item)
+}
+
+func summarizeStoredMessage(item storedMessage) string {
+	parts := item.DisplayParts
+	if len(parts) == 0 {
+		parts = buildDisplayParts(item.Wechat)
+	}
+
+	chunks := make([]string, 0, len(parts))
+	for _, part := range parts {
+		text := strings.TrimSpace(part.Text)
+		switch part.Type {
+		case "text", "quote", "sys":
+			if text != "" {
+				chunks = append(chunks, text)
+			}
+		case "image":
+			chunks = append(chunks, firstNonEmpty(part.Title, "图片"))
+		case "video":
+			chunks = append(chunks, firstNonEmpty(part.Title, "视频"))
+		default:
+			chunks = append(chunks, firstNonEmpty(text, part.Title, part.Type))
+		}
+	}
+	if len(chunks) > 0 {
+		return strings.Join(chunks, "\n")
+	}
+	return extractTextContent(item.Wechat)
 }
 
 func parseSysMessage(raw string) (sysMsgXML, bool) {

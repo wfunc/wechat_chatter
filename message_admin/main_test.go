@@ -52,3 +52,31 @@ func TestQuotedAppMessagePartNestedQuote(t *testing.T) {
 		}
 	}
 }
+
+func TestRevokeMessageTextIncludesOriginalContent(t *testing.T) {
+	state := &appState{messageByID: make(map[string]storedMessage)}
+	original := storedMessage{
+		Wechat: wechatMessage{
+			MessageID: "3830623364684938270",
+			Message: []messagePart{{
+				Type: "text",
+				Data: messagePartData{Text: "好家伙"},
+			}},
+		},
+	}
+	original.DisplayParts = state.buildDisplayParts(original.Wechat)
+	state.indexMessageLocked(original)
+
+	raw := `<sysmsg type="revokemsg"><revokemsg><session>49361126693@chatroom</session><msgid>2072638153</msgid><newmsgid>3830623364684938270</newmsgid><replacemsg><![CDATA["Giut.nik" 撤回了一条消息]]></replacemsg><announcement_id><![CDATA[]]></announcement_id></revokemsg></sysmsg>`
+	got := state.sysMessageText(raw)
+
+	for _, want := range []string{
+		`"Giut.nik" 撤回了一条消息`,
+		"原消息ID：3830623364684938270",
+		"撤回内容：好家伙",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("sysMessageText missing %q:\n%s", want, got)
+		}
+	}
+}
