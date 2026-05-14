@@ -1,0 +1,762 @@
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"encoding/xml"
+	"flag"
+	"fmt"
+	"html/template"
+	"io"
+	"log"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+)
+
+type sender struct {
+	UserID    string `json:"user_id"`
+	Nickname  string `json:"nickname"`
+	AvatarURL string `json:"avatar_url"`
+	Avatar    string `json:"avatar"`
+}
+
+type messagePart struct {
+	Type string          `json:"type"`
+	Data messagePartData `json:"data"`
+}
+
+type messagePartData struct {
+	Text string `json:"text,omitempty"`
+	File string `json:"file,omitempty"`
+	URL  string `json:"url,omitempty"`
+	QQ   string `json:"qq,omitempty"`
+}
+
+type wechatMessage struct {
+	GroupID     string        `json:"group_id"`
+	GroupName   string        `json:"group_name"`
+	AvatarURL   string        `json:"avatar_url"`
+	SelfID      string        `json:"self_id"`
+	UserID      string        `json:"user_id"`
+	Sender      *sender       `json:"sender"`
+	Time        int64         `json:"time"`
+	PostType    string        `json:"post_type"`
+	MessageID   string        `json:"message_id"`
+	Message     []messagePart `json:"message"`
+	MsgResource string        `json:"msgsource"`
+	RawMessage  string        `json:"raw_message"`
+	ShowContent string        `json:"show_content"`
+	MessageType string        `json:"message_type"`
+}
+
+type storedMessage struct {
+	ID           int64
+	ReceivedAt   time.Time
+	RawJSON      string
+	Wechat       wechatMessage
+	DisplayParts []displayPart
+}
+
+type displayPart struct {
+	Type     string
+	Text     string
+	URL      string
+	FilePath string
+	Title    string
+}
+
+type appState struct {
+	mu       sync.RWMutex
+	nextID   int64
+	messages []storedMessage
+	maxItems int
+}
+
+type appConfig struct {
+	listenAddr   string
+	onebotBase   string
+	maxMessages  int
+	staticPrefix string
+}
+
+type imageXML struct {
+	Image struct {
+		ThumbURL  string `xml:"cdnthumburl,attr"`
+		MidImgURL string `xml:"cdnmidimgurl,attr"`
+		Length    int    `xml:"length,attr"`
+		MD5       string `xml:"md5,attr"`
+	} `xml:"img"`
+}
+
+type videoXML struct {
+	Video struct {
+		ThumbURL  string `xml:"cdnthumburl,attr"`
+		VideoURL  string `xml:"cdnvideourl,attr"`
+		Length    int64  `xml:"length,attr"`
+		PlayLen   int    `xml:"playlength,attr"`
+		ThumbSize int    `xml:"cdnthumblength,attr"`
+	} `xml:"videomsg"`
+}
+
+type sendRequest struct {
+	Message []sendMessage `json:"message"`
+	UserID  string        `json:"user_id,omitempty"`
+	GroupID string        `json:"group_id,omitempty"`
+}
+
+type sendMessage struct {
+	Type string         `json:"type"`
+	Data map[string]any `json:"data"`
+}
+
+func main() {
+	var cfg appConfig
+	flag.StringVar(&cfg.listenAddr, "listen", "127.0.0.1:36060", "管理页面和 OneBot 回调监听地址")
+	flag.StringVar(&cfg.onebotBase, "onebot", "http://127.0.0.1:58080", "onebot 发送接口地址")
+	flag.IntVar(&cfg.maxMessages, "max", 500, "内存中最多保留的消息数量")
+	flag.StringVar(&cfg.staticPrefix, "static_prefix", "/file/", "本地 file:// 媒体代理路径前缀")
+	flag.Parse()
+
+	state := &appState{maxItems: cfg.maxMessages}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", state.handleIndex(cfg))
+	mux.HandleFunc("/onebot", state.handleOnebot)
+	mux.HandleFunc("/api/messages", state.handleMessages)
+	mux.HandleFunc("/reply", state.handleReply(cfg))
+	mux.HandleFunc(cfg.staticPrefix, handleLocalFile(cfg.staticPrefix))
+
+	log.Printf("message admin listening on http://%s", cfg.listenAddr)
+	log.Printf("onebot send target: %s", strings.TrimRight(cfg.onebotBase, "/"))
+	if err := http.ListenAndServe(cfg.listenAddr, mux); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func (s *appState) handleOnebot(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	var msg wechatMessage
+	if err := json.Unmarshal(body, &msg); err != nil {
+		http.Error(w, "invalid json: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	item := storedMessage{
+		ReceivedAt: time.Now(),
+		RawJSON:    string(body),
+		Wechat:     msg,
+	}
+	item.DisplayParts = buildDisplayParts(msg)
+
+	s.mu.Lock()
+	s.nextID++
+	item.ID = s.nextID
+	s.messages = append([]storedMessage{item}, s.messages...)
+	if s.maxItems > 0 && len(s.messages) > s.maxItems {
+		s.messages = s.messages[:s.maxItems]
+	}
+	s.mu.Unlock()
+
+	log.Printf("received message id=%d type=%s user=%s group=%s parts=%d", item.ID, msg.MessageType, msg.UserID, msg.GroupID, len(msg.Message))
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "id": item.ID})
+}
+
+func (s *appState) handleIndex(cfg appConfig) http.HandlerFunc {
+	tmpl := template.Must(template.New("index").Funcs(template.FuncMap{
+		"formatTime": formatTime,
+		"chatLabel":  chatLabel,
+		"chatType":   chatType,
+		"targetID":   targetID,
+		"mediaURL":   mediaURL,
+		"avatarURL":  avatarURL,
+		"avatarText": avatarText,
+	}).Parse(indexHTML))
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+
+		s.mu.RLock()
+		messages := make([]storedMessage, len(s.messages))
+		copy(messages, s.messages)
+		s.mu.RUnlock()
+
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		if err := tmpl.Execute(w, map[string]any{
+			"Messages": messages,
+			"Onebot":   cfg.onebotBase,
+		}); err != nil {
+			log.Printf("render index: %v", err)
+		}
+	}
+}
+
+func (s *appState) handleMessages(w http.ResponseWriter, r *http.Request) {
+	s.mu.RLock()
+	messages := make([]storedMessage, len(s.messages))
+	copy(messages, s.messages)
+	s.mu.RUnlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(messages)
+}
+
+func (s *appState) handleReply(cfg appConfig) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if err := r.ParseForm(); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		target := strings.TrimSpace(r.FormValue("target"))
+		chatType := strings.TrimSpace(r.FormValue("chat_type"))
+		text := strings.TrimSpace(r.FormValue("text"))
+		if target == "" || text == "" {
+			http.Error(w, "target and text are required", http.StatusBadRequest)
+			return
+		}
+
+		req := sendRequest{
+			Message: []sendMessage{{
+				Type: "text",
+				Data: map[string]any{"text": text},
+			}},
+		}
+		endpoint := "/send_private_msg"
+		if chatType == "group" {
+			req.GroupID = target
+			endpoint = "/send_group_msg"
+		} else {
+			req.UserID = target
+		}
+
+		if err := postOnebot(cfg.onebotBase, endpoint, req); err != nil {
+			http.Error(w, "send failed: "+err.Error(), http.StatusBadGateway)
+			return
+		}
+
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+	}
+}
+
+func postOnebot(base, endpoint string, req sendRequest) error {
+	payload, err := json.Marshal(req)
+	if err != nil {
+		return err
+	}
+
+	target := strings.TrimRight(base, "/") + endpoint
+	resp, err := http.Post(target, "application/json", bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("%s: %s", resp.Status, strings.TrimSpace(string(body)))
+	}
+	return nil
+}
+
+func buildDisplayParts(msg wechatMessage) []displayPart {
+	parts := make([]displayPart, 0, len(msg.Message))
+	for _, part := range msg.Message {
+		data := part.Data
+		switch part.Type {
+		case "text":
+			parts = append(parts, displayPart{Type: "text", Text: firstNonEmpty(data.Text, msg.ShowContent)})
+		case "image":
+			parts = append(parts, displayPart{Type: "image", Text: data.Text, URL: data.URL, FilePath: filePathFromURL(data.URL), Title: imageTitle(data.Text)})
+		case "video":
+			parts = append(parts, displayPart{Type: "video", Text: data.Text, URL: data.URL, FilePath: filePathFromURL(data.URL), Title: videoTitle(data.Text)})
+		case "at":
+			parts = append(parts, displayPart{Type: "text", Text: "@" + data.QQ})
+		default:
+			parts = append(parts, displayPart{Type: part.Type, Text: firstNonEmpty(data.Text, data.File, data.URL)})
+		}
+	}
+	if len(parts) == 0 && msg.RawMessage != "" {
+		parts = append(parts, displayPart{Type: "text", Text: msg.RawMessage})
+	}
+	return parts
+}
+
+func imageTitle(raw string) string {
+	var img imageXML
+	if err := xml.Unmarshal([]byte(raw), &img); err == nil {
+		fields := make([]string, 0, 3)
+		if img.Image.MD5 != "" {
+			fields = append(fields, "md5="+img.Image.MD5)
+		}
+		if img.Image.Length > 0 {
+			fields = append(fields, fmt.Sprintf("size=%d", img.Image.Length))
+		}
+		if img.Image.MidImgURL != "" {
+			fields = append(fields, "cdn=available")
+		}
+		if len(fields) > 0 {
+			return strings.Join(fields, " ")
+		}
+	}
+	return "图片"
+}
+
+func videoTitle(raw string) string {
+	var vid videoXML
+	if err := xml.Unmarshal([]byte(raw), &vid); err == nil {
+		fields := make([]string, 0, 3)
+		if vid.Video.PlayLen > 0 {
+			fields = append(fields, fmt.Sprintf("%ds", vid.Video.PlayLen))
+		}
+		if vid.Video.Length > 0 {
+			fields = append(fields, fmt.Sprintf("size=%d", vid.Video.Length))
+		}
+		if vid.Video.VideoURL != "" {
+			fields = append(fields, "cdn=available")
+		}
+		if len(fields) > 0 {
+			return strings.Join(fields, " ")
+		}
+	}
+	return "视频"
+}
+
+func handleLocalFile(prefix string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		encoded := strings.TrimPrefix(r.URL.Path, prefix)
+		path, err := url.PathUnescape(encoded)
+		if err != nil || path == "" {
+			http.NotFound(w, r)
+			return
+		}
+		clean := filepath.Clean(path)
+		if !filepath.IsAbs(clean) {
+			http.Error(w, "absolute path required", http.StatusBadRequest)
+			return
+		}
+		if _, err := os.Stat(clean); err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		http.ServeFile(w, r, clean)
+	}
+}
+
+func mediaURL(p displayPart) string {
+	if p.URL == "" {
+		return ""
+	}
+	if strings.HasPrefix(p.URL, "file://") {
+		path := strings.TrimPrefix(p.URL, "file://")
+		return "/file/" + url.PathEscape(path)
+	}
+	return p.URL
+}
+
+func filePathFromURL(raw string) string {
+	if strings.HasPrefix(raw, "file://") {
+		return strings.TrimPrefix(raw, "file://")
+	}
+	return ""
+}
+
+func formatTime(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.Format("2006-01-02 15:04:05")
+}
+
+func chatLabel(m wechatMessage) string {
+	if chatType(m) == "group" {
+		return "群消息"
+	}
+	return "个人消息"
+}
+
+func chatType(m wechatMessage) string {
+	if m.MessageType == "group" || m.GroupID != "" {
+		return "group"
+	}
+	return "private"
+}
+
+func targetID(m wechatMessage) string {
+	if m.GroupID != "" {
+		return m.GroupID
+	}
+	return m.UserID
+}
+
+func avatarURL(m wechatMessage) string {
+	if m.Sender != nil {
+		if strings.TrimSpace(m.Sender.AvatarURL) != "" {
+			return m.Sender.AvatarURL
+		}
+		if strings.TrimSpace(m.Sender.Avatar) != "" {
+			return m.Sender.Avatar
+		}
+	}
+	return strings.TrimSpace(m.AvatarURL)
+}
+
+func avatarText(m wechatMessage) string {
+	name := ""
+	if m.Sender != nil {
+		name = strings.TrimSpace(m.Sender.Nickname)
+	}
+	if name == "" {
+		name = strings.TrimSpace(m.UserID)
+	}
+	if name == "" {
+		return "?"
+	}
+	for _, r := range name {
+		return string(r)
+	}
+	return "?"
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+const indexHTML = `<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>微信消息管理</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f5f7f9;
+      --panel: #ffffff;
+      --line: #d8dee6;
+      --text: #1d242d;
+      --muted: #667381;
+      --accent: #16794f;
+      --accent-dark: #0f5f3e;
+      --warn: #8a5a00;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+    }
+    header {
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      background: rgba(255,255,255,.94);
+      border-bottom: 1px solid var(--line);
+      backdrop-filter: blur(10px);
+    }
+    .bar {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 14px 18px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+    }
+    h1 {
+      margin: 0;
+      font-size: 20px;
+      font-weight: 700;
+      letter-spacing: 0;
+    }
+    .meta {
+      color: var(--muted);
+      font-size: 13px;
+      white-space: nowrap;
+    }
+    main {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 18px;
+    }
+    .empty {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 32px;
+      color: var(--muted);
+      text-align: center;
+    }
+    .msg {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      margin-bottom: 14px;
+      overflow: hidden;
+    }
+    .msg-head {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 12px;
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--line);
+      background: #fbfcfd;
+    }
+    .identity {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+      min-width: 0;
+    }
+    .avatar {
+      width: 42px;
+      height: 42px;
+      flex: 0 0 auto;
+      border-radius: 8px;
+      border: 1px solid var(--line);
+      background: #e8f2ec;
+      color: var(--accent-dark);
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 800;
+      overflow: hidden;
+    }
+    .avatar img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      display: block;
+    }
+    .head-main {
+      min-width: 0;
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      min-height: 24px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      padding: 2px 8px;
+      color: var(--muted);
+      font-size: 12px;
+      background: #fff;
+    }
+    .badge.kind {
+      color: #fff;
+      border-color: var(--accent);
+      background: var(--accent);
+    }
+    .idline {
+      margin-top: 7px;
+      color: var(--muted);
+      font-size: 13px;
+      word-break: break-all;
+    }
+    .time {
+      color: var(--muted);
+      font-size: 13px;
+      white-space: nowrap;
+    }
+    .content {
+      padding: 14px 16px;
+      display: grid;
+      gap: 10px;
+    }
+    .part {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px;
+      background: #fff;
+    }
+    .part-label {
+      color: var(--muted);
+      font-size: 12px;
+      margin-bottom: 6px;
+    }
+    .text {
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-size: 15px;
+    }
+    img.media {
+      max-width: min(520px, 100%);
+      max-height: 420px;
+      display: block;
+      border-radius: 6px;
+      border: 1px solid var(--line);
+      background: #f0f2f4;
+      object-fit: contain;
+    }
+    video.media {
+      max-width: min(640px, 100%);
+      max-height: 460px;
+      display: block;
+      border-radius: 6px;
+      border: 1px solid var(--line);
+      background: #111;
+    }
+    .raw {
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 12px;
+      word-break: break-all;
+    }
+    details summary {
+      cursor: pointer;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    pre {
+      overflow: auto;
+      max-height: 260px;
+      padding: 10px;
+      background: #f4f6f8;
+      border-radius: 6px;
+      font-size: 12px;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    form.reply {
+      border-top: 1px solid var(--line);
+      padding: 12px 16px;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 10px;
+      background: #fbfcfd;
+    }
+    textarea {
+      width: 100%;
+      min-height: 42px;
+      max-height: 160px;
+      resize: vertical;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 9px 10px;
+      font: inherit;
+      background: #fff;
+      color: var(--text);
+    }
+    button {
+      align-self: start;
+      border: 0;
+      border-radius: 8px;
+      padding: 10px 16px;
+      font: inherit;
+      font-weight: 700;
+      color: #fff;
+      background: var(--accent);
+      cursor: pointer;
+    }
+    button:hover { background: var(--accent-dark); }
+    .hint {
+      grid-column: 1 / -1;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    @media (max-width: 720px) {
+      .bar, main { padding-left: 12px; padding-right: 12px; }
+      .msg-head { grid-template-columns: 1fr; }
+      .time { white-space: normal; }
+      form.reply { grid-template-columns: 1fr; }
+      button { width: 100%; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="bar">
+      <h1>微信消息管理</h1>
+      <div class="meta">接收端口 36060 · 转发到 {{.Onebot}}</div>
+    </div>
+  </header>
+  <main>
+    {{if not .Messages}}
+      <div class="empty">还没有收到消息</div>
+    {{end}}
+    {{range .Messages}}
+      <article class="msg">
+        <div class="msg-head">
+          <div class="identity">
+            <div class="avatar">
+              {{if avatarURL .Wechat}}<img src="{{avatarURL .Wechat}}" alt="头像">{{else}}{{avatarText .Wechat}}{{end}}
+            </div>
+            <div class="head-main">
+            <div class="identity">
+              <span class="badge kind">{{chatLabel .Wechat}}</span>
+              <span class="badge">微信昵称：{{if .Wechat.Sender}}{{.Wechat.Sender.Nickname}}{{else}}未知{{end}}</span>
+              <span class="badge">微信ID：{{.Wechat.UserID}}</span>
+            </div>
+            <div class="idline">
+              {{if .Wechat.GroupID}}
+                群名：{{if .Wechat.GroupName}}{{.Wechat.GroupName}}{{else}}未获取{{end}} · 群ID：{{.Wechat.GroupID}}
+              {{else}}
+                个人会话：{{.Wechat.UserID}}
+              {{end}}
+              {{if .Wechat.MessageID}} · 消息ID：{{.Wechat.MessageID}}{{end}}
+            </div>
+            </div>
+          </div>
+          <div class="time">{{formatTime .ReceivedAt}}</div>
+        </div>
+        <div class="content">
+          {{range .DisplayParts}}
+            <div class="part">
+              <div class="part-label">{{.Type}} {{if .Title}}· {{.Title}}{{end}}</div>
+              {{if eq .Type "image"}}
+                {{if mediaURL .}}<img class="media" src="{{mediaURL .}}" alt="图片消息">{{else}}<div class="text">图片文件尚未下载</div>{{end}}
+                {{if .FilePath}}<div class="raw">{{.FilePath}}</div>{{end}}
+              {{else if eq .Type "video"}}
+                {{if mediaURL .}}<video class="media" src="{{mediaURL .}}" controls preload="metadata"></video>{{else}}<div class="text">视频文件尚未下载</div>{{end}}
+                {{if .FilePath}}<div class="raw">{{.FilePath}}</div>{{end}}
+              {{else}}
+                <div class="text">{{.Text}}</div>
+              {{end}}
+            </div>
+          {{end}}
+          <details>
+            <summary>原始消息</summary>
+            <pre>{{.RawJSON}}</pre>
+          </details>
+        </div>
+        <form class="reply" method="post" action="/reply">
+          <input type="hidden" name="target" value="{{targetID .Wechat}}">
+          <input type="hidden" name="chat_type" value="{{chatType .Wechat}}">
+          <textarea name="text" placeholder="输入回复内容"></textarea>
+          <button type="submit">回复</button>
+          <div class="hint">回复目标：{{targetID .Wechat}}</div>
+        </form>
+      </article>
+    {{end}}
+  </main>
+</body>
+</html>`
