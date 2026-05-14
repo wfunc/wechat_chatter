@@ -18,3 +18,5 @@ onebot/file
 onebot/videos
 .claude
 message_admin/message-admin
+message_admin/state.json
+state.json

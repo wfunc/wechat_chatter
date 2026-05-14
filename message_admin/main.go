@@ -77,11 +77,14 @@ type appState struct {
 	nextID        int64
 	messages      []storedMessage
 	maxItems      int
+	statePath     string
 	repeatMu      sync.Mutex
 	repeatGroups  map[string]struct{}
 	repeatByGroup map[string]repeatState
 	displayMu     sync.RWMutex
 	hiddenTargets map[string]hiddenTarget
+	groupNameMu   sync.RWMutex
+	groupNames    map[string]string
 }
 
 type repeatState struct {
@@ -97,11 +100,23 @@ type hiddenTarget struct {
 	BlockedAt time.Time
 }
 
+type groupNameEntry struct {
+	GroupID string
+	Name    string
+}
+
+type persistedState struct {
+	RepeatGroups  []string          `json:"repeat_groups"`
+	HiddenTargets []hiddenTarget    `json:"hidden_targets"`
+	GroupNames    map[string]string `json:"group_names"`
+}
+
 type appConfig struct {
 	listenAddr   string
 	onebotBase   string
 	maxMessages  int
 	staticPrefix string
+	statePath    string
 }
 
 type imageXML struct {
@@ -157,14 +172,20 @@ func main() {
 	flag.StringVar(&cfg.onebotBase, "onebot", "http://127.0.0.1:58080", "onebot 发送接口地址")
 	flag.IntVar(&cfg.maxMessages, "max", 500, "内存中最多保留的消息数量")
 	flag.StringVar(&cfg.staticPrefix, "static_prefix", "/file/", "本地 file:// 媒体代理路径前缀")
+	flag.StringVar(&cfg.statePath, "state", "state.json", "监听群和显示过滤配置保存文件")
 	flag.StringVar(&repeatGroups, "repeat_groups", "", "启用连续重复内容自动跟发的群ID，多个用逗号分隔")
 	flag.Parse()
 
 	state := &appState{
 		maxItems:      cfg.maxMessages,
+		statePath:     cfg.statePath,
 		repeatGroups:  parseGroupSet(repeatGroups),
 		repeatByGroup: make(map[string]repeatState),
 		hiddenTargets: make(map[string]hiddenTarget),
+		groupNames:    make(map[string]string),
+	}
+	if err := state.loadState(); err != nil {
+		log.Printf("load state failed path=%s err=%v", cfg.statePath, err)
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", state.handleIndex(cfg))
@@ -173,6 +194,7 @@ func main() {
 	mux.HandleFunc("/reply", state.handleReply(cfg))
 	mux.HandleFunc("/repeat-groups", state.handleRepeatGroups)
 	mux.HandleFunc("/display-targets", state.handleDisplayTargets)
+	mux.HandleFunc("/group-names", state.handleGroupNames)
 	mux.HandleFunc(cfg.staticPrefix, handleLocalFile(cfg.staticPrefix))
 
 	log.Printf("message admin listening on http://%s", cfg.listenAddr)
@@ -248,6 +270,7 @@ func (s *appState) handleIndex(cfg appConfig) http.HandlerFunc {
 		"mediaURL":   mediaURL,
 		"avatarURL":  avatarURL,
 		"avatarText": avatarText,
+		"groupName":  s.displayGroupName,
 	}).Parse(indexHTML))
 
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -267,6 +290,8 @@ func (s *appState) handleIndex(cfg appConfig) http.HandlerFunc {
 			"Onebot":        cfg.onebotBase,
 			"RepeatGroups":  s.repeatGroupList(),
 			"HiddenTargets": s.hiddenTargetList(),
+			"GroupNames":    s.groupNameList(),
+			"StatePath":     cfg.statePath,
 		}); err != nil {
 			log.Printf("render index: %v", err)
 		}
@@ -352,6 +377,12 @@ func (s *appState) handleRepeatGroups(w http.ResponseWriter, r *http.Request) {
 	}
 	s.repeatMu.Unlock()
 
+	if err := s.saveState(); err != nil {
+		log.Printf("save state failed: %v", err)
+		http.Error(w, "save state failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
@@ -390,8 +421,147 @@ func (s *appState) handleDisplayTargets(w http.ResponseWriter, r *http.Request) 
 	if action != "show" {
 		s.removeDisplayedTarget(kind, target)
 	}
+	if err := s.saveState(); err != nil {
+		log.Printf("save state failed: %v", err)
+		http.Error(w, "save state failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
 
 	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
+func (s *appState) handleGroupNames(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	groupID := strings.TrimSpace(r.FormValue("group_id"))
+	name := strings.TrimSpace(r.FormValue("group_name"))
+	action := strings.TrimSpace(r.FormValue("action"))
+	if groupID == "" {
+		http.Error(w, "group_id is required", http.StatusBadRequest)
+		return
+	}
+
+	s.groupNameMu.Lock()
+	switch action {
+	case "remove":
+		delete(s.groupNames, groupID)
+	default:
+		if name == "" {
+			s.groupNameMu.Unlock()
+			http.Error(w, "group_name is required", http.StatusBadRequest)
+			return
+		}
+		s.groupNames[groupID] = name
+	}
+	s.groupNameMu.Unlock()
+
+	if err := s.saveState(); err != nil {
+		log.Printf("save state failed: %v", err)
+		http.Error(w, "save state failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
+func (s *appState) loadState() error {
+	if strings.TrimSpace(s.statePath) == "" {
+		return nil
+	}
+
+	data, err := os.ReadFile(s.statePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+
+	var persisted persistedState
+	if err := json.Unmarshal(data, &persisted); err != nil {
+		return err
+	}
+
+	s.repeatMu.Lock()
+	if s.repeatGroups == nil {
+		s.repeatGroups = make(map[string]struct{})
+	}
+	for _, groupID := range persisted.RepeatGroups {
+		groupID = strings.TrimSpace(groupID)
+		if groupID != "" {
+			s.repeatGroups[groupID] = struct{}{}
+		}
+	}
+	s.repeatMu.Unlock()
+
+	s.displayMu.Lock()
+	if s.hiddenTargets == nil {
+		s.hiddenTargets = make(map[string]hiddenTarget)
+	}
+	for _, target := range persisted.HiddenTargets {
+		target.ID = strings.TrimSpace(target.ID)
+		target.Kind = normalizeChatKind(target.Kind)
+		if target.ID == "" {
+			continue
+		}
+		if target.BlockedAt.IsZero() {
+			target.BlockedAt = time.Now()
+		}
+		s.hiddenTargets[displayTargetKey(target.Kind, target.ID)] = target
+	}
+	s.displayMu.Unlock()
+
+	s.groupNameMu.Lock()
+	if s.groupNames == nil {
+		s.groupNames = make(map[string]string)
+	}
+	for groupID, name := range persisted.GroupNames {
+		groupID = strings.TrimSpace(groupID)
+		name = strings.TrimSpace(name)
+		if groupID != "" && name != "" {
+			s.groupNames[groupID] = name
+		}
+	}
+	s.groupNameMu.Unlock()
+
+	return nil
+}
+
+func (s *appState) saveState() error {
+	if strings.TrimSpace(s.statePath) == "" {
+		return nil
+	}
+
+	persisted := persistedState{
+		RepeatGroups:  s.repeatGroupList(),
+		HiddenTargets: s.hiddenTargetList(),
+		GroupNames:    s.groupNameMap(),
+	}
+	data, err := json.MarshalIndent(persisted, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+
+	dir := filepath.Dir(s.statePath)
+	if dir != "." && dir != "" {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return err
+		}
+	}
+
+	tmp := s.statePath + ".tmp"
+	if err := os.WriteFile(tmp, data, 0644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, s.statePath)
 }
 
 func (s *appState) isDisplayHidden(msg wechatMessage) bool {
@@ -436,6 +606,42 @@ func (s *appState) hiddenTargetList() []hiddenTarget {
 		return targets[i].ID < targets[j].ID
 	})
 	return targets
+}
+
+func (s *appState) groupNameList() []groupNameEntry {
+	s.groupNameMu.RLock()
+	defer s.groupNameMu.RUnlock()
+
+	entries := make([]groupNameEntry, 0, len(s.groupNames))
+	for groupID, name := range s.groupNames {
+		entries = append(entries, groupNameEntry{GroupID: groupID, Name: name})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].GroupID < entries[j].GroupID
+	})
+	return entries
+}
+
+func (s *appState) groupNameMap() map[string]string {
+	s.groupNameMu.RLock()
+	defer s.groupNameMu.RUnlock()
+
+	names := make(map[string]string, len(s.groupNames))
+	for groupID, name := range s.groupNames {
+		names[groupID] = name
+	}
+	return names
+}
+
+func (s *appState) displayGroupName(m wechatMessage) string {
+	groupID := strings.TrimSpace(m.GroupID)
+	if groupID == "" {
+		return ""
+	}
+	s.groupNameMu.RLock()
+	name := strings.TrimSpace(s.groupNames[groupID])
+	s.groupNameMu.RUnlock()
+	return firstNonEmpty(name, m.GroupName)
 }
 
 func displayTargetKey(kind, target string) string {
@@ -1197,7 +1403,31 @@ const indexHTML = `<!doctype html>
           <span class="badge">未设置监听群</span>
         {{end}}
       </div>
-      <div class="hint">同一个监听群里，连续两个不同微信ID发送相同文字时，自动向该群发送一次相同文字；同一段连续重复只触发一次。</div>
+      <div class="hint">同一个监听群里，连续两个不同微信ID发送相同文字时，自动向该群发送一次相同文字；同一段连续重复只触发一次。配置保存：{{.StatePath}}</div>
+    </section>
+    <section class="rule-panel">
+      <h2 class="rule-title">群名设置</h2>
+      <form class="rule-form" method="post" action="/group-names">
+        <input type="text" name="group_id" placeholder="群ID，例如 48809018751@chatroom">
+        <input type="text" name="group_name" placeholder="要显示的群名">
+        <button type="submit">保存群名</button>
+      </form>
+      <div class="rule-row">
+        {{if .GroupNames}}
+          {{range .GroupNames}}
+            <span class="badge">
+              {{.Name}}：{{.GroupID}}
+              <form class="inline-form" method="post" action="/group-names">
+                <input type="hidden" name="action" value="remove">
+                <input type="hidden" name="group_id" value="{{.GroupID}}">
+                <button class="remove-btn" type="submit">删除</button>
+              </form>
+            </span>
+          {{end}}
+        {{else}}
+          <span class="badge">未设置群名</span>
+        {{end}}
+      </div>
     </section>
     <section class="rule-panel">
       <h2 class="rule-title">已关闭显示</h2>
@@ -1237,7 +1467,7 @@ const indexHTML = `<!doctype html>
             </div>
             <div class="idline">
               {{if .Wechat.GroupID}}
-                群名：{{if .Wechat.GroupName}}{{.Wechat.GroupName}}{{else}}未获取{{end}} · 群ID：{{.Wechat.GroupID}}
+                群名：{{if groupName .Wechat}}{{groupName .Wechat}}{{else}}未设置{{end}} · 群ID：{{.Wechat.GroupID}}
               {{else}}
                 个人会话：{{.Wechat.UserID}}
               {{end}}
