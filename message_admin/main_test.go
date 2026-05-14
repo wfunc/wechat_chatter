@@ -120,3 +120,95 @@ func TestFilterMessages(t *testing.T) {
 		t.Fatalf("empty filter len = %d", len(all))
 	}
 }
+
+func TestApplyRepeatRuleSuppressesSameTextWithinFiveMinutes(t *testing.T) {
+	state := &appState{
+		repeatGroups: map[string]struct{}{"g1@chatroom": {}},
+		repeatByGroup: map[string]repeatState{
+			"g1@chatroom": {
+				LastUserID: "u1",
+				LastText:   "hello",
+			},
+		},
+		sensitiveWords: make(map[string]struct{}),
+	}
+	oldSend := sendGroupTextFunc
+	defer func() { sendGroupTextFunc = oldSend }()
+
+	var sent int
+	sendGroupTextFunc = func(_, _, _ string) error {
+		sent++
+		return nil
+	}
+
+	msg := wechatMessage{
+		GroupID:     "g1@chatroom",
+		UserID:      "u2",
+		MessageID:   "m2",
+		MessageType: "group",
+		Message: []messagePart{{
+			Type: "text",
+			Data: messagePartData{Text: "hello"},
+		}},
+	}
+	if err := state.applyRepeatRule(appConfig{}, msg); err != nil {
+		t.Fatalf("first applyRepeatRule error = %v", err)
+	}
+	if sent != 1 {
+		t.Fatalf("sent after first match = %d", sent)
+	}
+
+	state.repeatMu.Lock()
+	prev := state.repeatByGroup["g1@chatroom"]
+	prev.LastUserID = "u3"
+	prev.LastText = "hello"
+	prev.TriggeredText = ""
+	state.repeatByGroup["g1@chatroom"] = prev
+	state.repeatMu.Unlock()
+
+	msg.UserID = "u4"
+	msg.MessageID = "m3"
+	if err := state.applyRepeatRule(appConfig{}, msg); err != nil {
+		t.Fatalf("second applyRepeatRule error = %v", err)
+	}
+	if sent != 1 {
+		t.Fatalf("sent after suppressed second match = %d", sent)
+	}
+}
+
+func TestApplyRepeatRuleSkipsSensitiveWords(t *testing.T) {
+	state := &appState{
+		repeatGroups:   map[string]struct{}{"g1@chatroom": {}},
+		repeatByGroup:  make(map[string]repeatState),
+		sensitiveWords: map[string]struct{}{"secret": {}},
+	}
+	state.repeatByGroup["g1@chatroom"] = repeatState{
+		LastUserID: "u1",
+		LastText:   "hello secret",
+	}
+	oldSend := sendGroupTextFunc
+	defer func() { sendGroupTextFunc = oldSend }()
+
+	var sent int
+	sendGroupTextFunc = func(_, _, _ string) error {
+		sent++
+		return nil
+	}
+
+	msg := wechatMessage{
+		GroupID:     "g1@chatroom",
+		UserID:      "u2",
+		MessageID:   "m2",
+		MessageType: "group",
+		Message: []messagePart{{
+			Type: "text",
+			Data: messagePartData{Text: "hello secret"},
+		}},
+	}
+	if err := state.applyRepeatRule(appConfig{}, msg); err != nil {
+		t.Fatalf("applyRepeatRule error = %v", err)
+	}
+	if sent != 0 {
+		t.Fatalf("sent sensitive repeat = %d", sent)
+	}
+}

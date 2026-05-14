@@ -74,28 +74,30 @@ type displayPart struct {
 }
 
 type appState struct {
-	mu            sync.RWMutex
-	nextID        int64
-	messages      []storedMessage
-	messageByID   map[string]storedMessage
-	maxItems      int
-	statePath     string
-	repeatMu      sync.Mutex
-	repeatGroups  map[string]struct{}
-	repeatByGroup map[string]repeatState
-	displayMu     sync.RWMutex
-	hiddenTargets map[string]hiddenTarget
-	groupNameMu   sync.RWMutex
-	groupNames    map[string]string
-	eventMu       sync.Mutex
-	eventClients  map[chan string]struct{}
+	mu             sync.RWMutex
+	nextID         int64
+	messages       []storedMessage
+	messageByID    map[string]storedMessage
+	maxItems       int
+	statePath      string
+	repeatMu       sync.Mutex
+	repeatGroups   map[string]struct{}
+	repeatByGroup  map[string]repeatState
+	sensitiveWords map[string]struct{}
+	displayMu      sync.RWMutex
+	hiddenTargets  map[string]hiddenTarget
+	groupNameMu    sync.RWMutex
+	groupNames     map[string]string
+	eventMu        sync.Mutex
+	eventClients   map[chan string]struct{}
 }
 
 type repeatState struct {
-	LastUserID    string
-	LastText      string
-	LastMessageID string
-	TriggeredText string
+	LastUserID        string
+	LastText          string
+	LastMessageID     string
+	TriggeredText     string
+	TriggeredAtByText map[string]time.Time
 }
 
 type hiddenTarget struct {
@@ -117,9 +119,10 @@ type viewFilter struct {
 }
 
 type persistedState struct {
-	RepeatGroups  []string          `json:"repeat_groups"`
-	HiddenTargets []hiddenTarget    `json:"hidden_targets"`
-	GroupNames    map[string]string `json:"group_names"`
+	RepeatGroups   []string          `json:"repeat_groups"`
+	SensitiveWords []string          `json:"sensitive_words"`
+	HiddenTargets  []hiddenTarget    `json:"hidden_targets"`
+	GroupNames     map[string]string `json:"group_names"`
 }
 
 type appConfig struct {
@@ -214,6 +217,8 @@ type sendMessage struct {
 	Data map[string]any `json:"data"`
 }
 
+var sendGroupTextFunc = sendGroupText
+
 func main() {
 	var cfg appConfig
 	var repeatGroups string
@@ -226,14 +231,15 @@ func main() {
 	flag.Parse()
 
 	state := &appState{
-		maxItems:      cfg.maxMessages,
-		messageByID:   make(map[string]storedMessage),
-		statePath:     cfg.statePath,
-		repeatGroups:  parseGroupSet(repeatGroups),
-		repeatByGroup: make(map[string]repeatState),
-		hiddenTargets: make(map[string]hiddenTarget),
-		groupNames:    make(map[string]string),
-		eventClients:  make(map[chan string]struct{}),
+		maxItems:       cfg.maxMessages,
+		messageByID:    make(map[string]storedMessage),
+		statePath:      cfg.statePath,
+		repeatGroups:   parseGroupSet(repeatGroups),
+		repeatByGroup:  make(map[string]repeatState),
+		sensitiveWords: make(map[string]struct{}),
+		hiddenTargets:  make(map[string]hiddenTarget),
+		groupNames:     make(map[string]string),
+		eventClients:   make(map[chan string]struct{}),
 	}
 	if err := state.loadState(); err != nil {
 		log.Printf("load state failed path=%s err=%v", cfg.statePath, err)
@@ -246,6 +252,7 @@ func main() {
 	mux.HandleFunc("/reply", state.handleReply(cfg))
 	mux.HandleFunc("/send-image", state.handleSendImage(cfg))
 	mux.HandleFunc("/repeat-groups", state.handleRepeatGroups)
+	mux.HandleFunc("/sensitive-words", state.handleSensitiveWords)
 	mux.HandleFunc("/display-targets", state.handleDisplayTargets)
 	mux.HandleFunc("/group-names", state.handleGroupNames)
 	mux.HandleFunc(cfg.staticPrefix, handleLocalFile(cfg.staticPrefix))
@@ -346,13 +353,14 @@ func (s *appState) handleIndex(cfg appConfig) http.HandlerFunc {
 
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		if err := tmpl.Execute(w, map[string]any{
-			"Messages":      messages,
-			"Filter":        filter,
-			"Onebot":        cfg.onebotBase,
-			"RepeatGroups":  s.repeatGroupList(),
-			"HiddenTargets": s.hiddenTargetList(),
-			"GroupNames":    s.groupNameList(),
-			"StatePath":     cfg.statePath,
+			"Messages":       messages,
+			"Filter":         filter,
+			"Onebot":         cfg.onebotBase,
+			"RepeatGroups":   s.repeatGroupList(),
+			"SensitiveWords": s.sensitiveWordList(),
+			"HiddenTargets":  s.hiddenTargetList(),
+			"GroupNames":     s.groupNameList(),
+			"StatePath":      cfg.statePath,
 		}); err != nil {
 			log.Printf("render index: %v", err)
 		}
@@ -546,6 +554,44 @@ func (s *appState) handleRepeatGroups(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
+func (s *appState) handleSensitiveWords(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	word := strings.TrimSpace(r.FormValue("word"))
+	action := strings.TrimSpace(r.FormValue("action"))
+	if word == "" {
+		http.Error(w, "word is required", http.StatusBadRequest)
+		return
+	}
+
+	s.repeatMu.Lock()
+	switch action {
+	case "remove":
+		delete(s.sensitiveWords, word)
+	default:
+		if s.sensitiveWords == nil {
+			s.sensitiveWords = make(map[string]struct{})
+		}
+		s.sensitiveWords[word] = struct{}{}
+	}
+	s.repeatMu.Unlock()
+
+	if err := s.saveState(); err != nil {
+		log.Printf("save state failed: %v", err)
+		http.Error(w, "save state failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
 func (s *appState) handleDisplayTargets(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -659,6 +705,15 @@ func (s *appState) loadState() error {
 			s.repeatGroups[groupID] = struct{}{}
 		}
 	}
+	if s.sensitiveWords == nil {
+		s.sensitiveWords = make(map[string]struct{})
+	}
+	for _, word := range persisted.SensitiveWords {
+		word = strings.TrimSpace(word)
+		if word != "" {
+			s.sensitiveWords[word] = struct{}{}
+		}
+	}
 	s.repeatMu.Unlock()
 
 	s.displayMu.Lock()
@@ -700,9 +755,10 @@ func (s *appState) saveState() error {
 	}
 
 	persisted := persistedState{
-		RepeatGroups:  s.repeatGroupList(),
-		HiddenTargets: s.hiddenTargetList(),
-		GroupNames:    s.groupNameMap(),
+		RepeatGroups:   s.repeatGroupList(),
+		SensitiveWords: s.sensitiveWordList(),
+		HiddenTargets:  s.hiddenTargetList(),
+		GroupNames:     s.groupNameMap(),
 	}
 	data, err := json.MarshalIndent(persisted, "", "  ")
 	if err != nil {
@@ -869,19 +925,36 @@ func (s *appState) applyRepeatRule(cfg appConfig, msg wechatMessage) error {
 		return nil
 	}
 
+	now := time.Now()
 	var shouldSend bool
 	s.repeatMu.Lock()
 	if _, ok := s.repeatGroups[groupID]; ok {
+		if s.hasSensitiveWordLocked(text) {
+			log.Printf("repeat rule skipped sensitive group=%s text=%q", groupID, text)
+			s.repeatMu.Unlock()
+			return nil
+		}
 		prev := s.repeatByGroup[groupID]
 		if prev.LastText != text {
 			prev.TriggeredText = ""
 		}
+		if prev.TriggeredAtByText == nil {
+			prev.TriggeredAtByText = make(map[string]time.Time)
+		}
+		for triggeredText, triggeredAt := range prev.TriggeredAtByText {
+			if now.Sub(triggeredAt) > 10*time.Minute {
+				delete(prev.TriggeredAtByText, triggeredText)
+			}
+		}
+		lastTriggeredAt, triggeredRecently := prev.TriggeredAtByText[text]
 		shouldSend = prev.LastText == text &&
 			prev.LastUserID != "" &&
 			prev.LastUserID != userID &&
-			prev.TriggeredText != text
+			prev.TriggeredText != text &&
+			(!triggeredRecently || now.Sub(lastTriggeredAt) >= 5*time.Minute)
 		if shouldSend {
 			prev.TriggeredText = text
+			prev.TriggeredAtByText[text] = now
 		}
 		prev.LastUserID = userID
 		prev.LastText = text
@@ -895,7 +968,21 @@ func (s *appState) applyRepeatRule(cfg appConfig, msg wechatMessage) error {
 	}
 
 	log.Printf("repeat rule matched group=%s text=%q", groupID, text)
-	return sendGroupText(cfg.onebotBase, groupID, text)
+	return sendGroupTextFunc(cfg.onebotBase, groupID, text)
+}
+
+func (s *appState) hasSensitiveWordLocked(text string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(text))
+	if normalized == "" {
+		return false
+	}
+	for word := range s.sensitiveWords {
+		word = strings.ToLower(strings.TrimSpace(word))
+		if word != "" && strings.Contains(normalized, word) {
+			return true
+		}
+	}
+	return false
 }
 
 func sendGroupText(onebotBase, groupID, text string) error {
@@ -918,6 +1005,18 @@ func (s *appState) repeatGroupList() []string {
 	}
 	sort.Strings(groups)
 	return groups
+}
+
+func (s *appState) sensitiveWordList() []string {
+	s.repeatMu.Lock()
+	defer s.repeatMu.Unlock()
+
+	words := make([]string, 0, len(s.sensitiveWords))
+	for word := range s.sensitiveWords {
+		words = append(words, word)
+	}
+	sort.Strings(words)
+	return words
 }
 
 func parseGroupSet(raw string) map[string]struct{} {
@@ -1887,6 +1986,30 @@ const indexHTML = `<!doctype html>
         {{end}}
       </div>
       <div class="hint">同一个监听群里，连续两个不同微信ID发送相同文字时，自动向该群发送一次相同文字；同一段连续重复只触发一次。配置保存：{{.StatePath}}</div>
+      <div class="hint">同一个群里相同内容触发后，5分钟内不会再次自动跟发；命中敏感词的内容不会自动跟发。</div>
+    </section>
+    <section class="rule-panel">
+      <h2 class="rule-title">跟发敏感词</h2>
+      <form class="rule-form" method="post" action="/sensitive-words">
+        <input type="text" name="word" placeholder="输入敏感词，命中后不自动跟发">
+        <button type="submit">添加敏感词</button>
+      </form>
+      <div class="rule-row">
+        {{if .SensitiveWords}}
+          {{range .SensitiveWords}}
+            <span class="badge">
+              {{.}}
+              <form class="inline-form" method="post" action="/sensitive-words">
+                <input type="hidden" name="action" value="remove">
+                <input type="hidden" name="word" value="{{.}}">
+                <button class="remove-btn" type="submit">移除</button>
+              </form>
+            </span>
+          {{end}}
+        {{else}}
+          <span class="badge">未设置敏感词</span>
+        {{end}}
+      </div>
     </section>
     <section class="rule-panel">
       <h2 class="rule-title">群名设置</h2>
