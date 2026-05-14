@@ -322,17 +322,32 @@ func (s *appState) handleReply(cfg appConfig) http.HandlerFunc {
 		target := strings.TrimSpace(r.FormValue("target"))
 		chatType := strings.TrimSpace(r.FormValue("chat_type"))
 		text := strings.TrimSpace(r.FormValue("text"))
+		mode := strings.TrimSpace(r.FormValue("mode"))
 		if target == "" || text == "" {
 			http.Error(w, "target and text are required", http.StatusBadRequest)
 			return
 		}
 
-		req := sendRequest{
-			Message: []sendMessage{{
-				Type: "text",
-				Data: map[string]any{"text": text},
-			}},
+		msg := sendMessage{
+			Type: "text",
+			Data: map[string]any{"text": text},
 		}
+		if mode == "quote" {
+			replyMessage, err := parseReplyMessage(r.FormValue("reply_message"))
+			if err != nil {
+				http.Error(w, "invalid reply_message: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+			msg = sendMessage{
+				Type: "reply",
+				Data: map[string]any{
+					"text":          text,
+					"reply_message": replyMessage,
+				},
+			}
+		}
+
+		req := sendRequest{Message: []sendMessage{msg}}
 		endpoint := "/send_private_msg"
 		if chatType == "group" {
 			req.GroupID = target
@@ -348,6 +363,27 @@ func (s *appState) handleReply(cfg appConfig) http.HandlerFunc {
 
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 	}
+}
+
+func parseReplyMessage(raw string) (wechatMessage, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return wechatMessage{}, fmt.Errorf("empty")
+	}
+	var msg wechatMessage
+	if err := json.Unmarshal([]byte(raw), &msg); err != nil {
+		return wechatMessage{}, err
+	}
+	if msg.MessageID == "" {
+		return wechatMessage{}, fmt.Errorf("missing message_id")
+	}
+	if msg.UserID == "" {
+		return wechatMessage{}, fmt.Errorf("missing user_id")
+	}
+	if len(msg.Message) == 0 {
+		return wechatMessage{}, fmt.Errorf("missing message")
+	}
+	return msg, nil
 }
 
 func (s *appState) handleRepeatGroups(w http.ResponseWriter, r *http.Request) {
@@ -1279,7 +1315,7 @@ const indexHTML = `<!doctype html>
       border-top: 1px solid var(--line);
       padding: 12px 16px;
       display: grid;
-      grid-template-columns: minmax(0, 1fr) auto auto;
+      grid-template-columns: minmax(0, 1fr) auto auto auto;
       gap: 10px;
       background: #fbfcfd;
     }
@@ -1500,8 +1536,10 @@ const indexHTML = `<!doctype html>
         <form class="reply" method="post" action="/reply">
           <input type="hidden" name="target" value="{{targetID .Wechat}}">
           <input type="hidden" name="chat_type" value="{{chatType .Wechat}}">
+          <input type="hidden" name="reply_message" value="{{.RawJSON}}">
           <textarea name="text" placeholder="输入回复内容"></textarea>
-          <button type="submit">回复</button>
+          <button type="submit" name="mode" value="normal">回复</button>
+          <button class="secondary" type="submit" name="mode" value="quote">引用回复</button>
           <button class="secondary" type="submit" form="hide-{{.ID}}">关闭显示</button>
           <div class="hint">回复目标：{{targetID .Wechat}}</div>
         </form>
