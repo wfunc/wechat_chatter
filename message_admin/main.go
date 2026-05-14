@@ -79,6 +79,8 @@ type appState struct {
 	repeatMu      sync.Mutex
 	repeatGroups  map[string]struct{}
 	repeatByGroup map[string]repeatState
+	displayMu     sync.RWMutex
+	hiddenTargets map[string]hiddenTarget
 }
 
 type repeatState struct {
@@ -86,6 +88,12 @@ type repeatState struct {
 	LastText      string
 	LastMessageID string
 	TriggeredText string
+}
+
+type hiddenTarget struct {
+	ID        string
+	Kind      string
+	BlockedAt time.Time
 }
 
 type appConfig struct {
@@ -139,6 +147,7 @@ func main() {
 		maxItems:      cfg.maxMessages,
 		repeatGroups:  parseGroupSet(repeatGroups),
 		repeatByGroup: make(map[string]repeatState),
+		hiddenTargets: make(map[string]hiddenTarget),
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", state.handleIndex(cfg))
@@ -146,6 +155,7 @@ func main() {
 	mux.HandleFunc("/api/messages", state.handleMessages)
 	mux.HandleFunc("/reply", state.handleReply(cfg))
 	mux.HandleFunc("/repeat-groups", state.handleRepeatGroups)
+	mux.HandleFunc("/display-targets", state.handleDisplayTargets)
 	mux.HandleFunc(cfg.staticPrefix, handleLocalFile(cfg.staticPrefix))
 
 	log.Printf("message admin listening on http://%s", cfg.listenAddr)
@@ -177,29 +187,38 @@ func (s *appState) handleOnebot(cfg appConfig) http.HandlerFunc {
 			return
 		}
 
-		item := storedMessage{
-			ReceivedAt: time.Now(),
-			RawJSON:    string(body),
-			Wechat:     msg,
-		}
-		item.DisplayParts = buildDisplayParts(msg)
-
-		s.mu.Lock()
-		s.nextID++
-		item.ID = s.nextID
-		s.messages = append([]storedMessage{item}, s.messages...)
-		if s.maxItems > 0 && len(s.messages) > s.maxItems {
-			s.messages = s.messages[:s.maxItems]
-		}
-		s.mu.Unlock()
-
 		if err := s.applyRepeatRule(cfg, msg); err != nil {
 			log.Printf("repeat rule send failed group=%s user=%s err=%v", msg.GroupID, msg.UserID, err)
 		}
 
-		log.Printf("received message id=%d type=%s user=%s group=%s parts=%d", item.ID, msg.MessageType, msg.UserID, msg.GroupID, len(msg.Message))
+		var itemID int64
+		hidden := s.isDisplayHidden(msg)
+		if !hidden {
+			item := storedMessage{
+				ReceivedAt: time.Now(),
+				RawJSON:    string(body),
+				Wechat:     msg,
+			}
+			item.DisplayParts = buildDisplayParts(msg)
+
+			s.mu.Lock()
+			s.nextID++
+			item.ID = s.nextID
+			s.messages = append([]storedMessage{item}, s.messages...)
+			if s.maxItems > 0 && len(s.messages) > s.maxItems {
+				s.messages = s.messages[:s.maxItems]
+			}
+			s.mu.Unlock()
+			itemID = item.ID
+		}
+
+		if hidden {
+			log.Printf("received hidden message type=%s user=%s group=%s parts=%d", msg.MessageType, msg.UserID, msg.GroupID, len(msg.Message))
+		} else {
+			log.Printf("received message id=%d type=%s user=%s group=%s parts=%d", itemID, msg.MessageType, msg.UserID, msg.GroupID, len(msg.Message))
+		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "id": item.ID})
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "id": itemID, "hidden": hidden})
 	}
 }
 
@@ -227,9 +246,10 @@ func (s *appState) handleIndex(cfg appConfig) http.HandlerFunc {
 
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		if err := tmpl.Execute(w, map[string]any{
-			"Messages":     messages,
-			"Onebot":       cfg.onebotBase,
-			"RepeatGroups": s.repeatGroupList(),
+			"Messages":      messages,
+			"Onebot":        cfg.onebotBase,
+			"RepeatGroups":  s.repeatGroupList(),
+			"HiddenTargets": s.hiddenTargetList(),
 		}); err != nil {
 			log.Printf("render index: %v", err)
 		}
@@ -316,6 +336,100 @@ func (s *appState) handleRepeatGroups(w http.ResponseWriter, r *http.Request) {
 	s.repeatMu.Unlock()
 
 	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
+func (s *appState) handleDisplayTargets(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	target := strings.TrimSpace(r.FormValue("target"))
+	kind := normalizeChatKind(r.FormValue("chat_type"))
+	action := strings.TrimSpace(r.FormValue("action"))
+	if target == "" {
+		http.Error(w, "target is required", http.StatusBadRequest)
+		return
+	}
+
+	key := displayTargetKey(kind, target)
+	s.displayMu.Lock()
+	switch action {
+	case "show":
+		delete(s.hiddenTargets, key)
+	default:
+		s.hiddenTargets[key] = hiddenTarget{
+			ID:        target,
+			Kind:      kind,
+			BlockedAt: time.Now(),
+		}
+	}
+	s.displayMu.Unlock()
+
+	if action != "show" {
+		s.removeDisplayedTarget(kind, target)
+	}
+
+	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
+func (s *appState) isDisplayHidden(msg wechatMessage) bool {
+	kind := chatType(msg)
+	target := targetID(msg)
+	if target == "" {
+		return false
+	}
+
+	s.displayMu.RLock()
+	_, ok := s.hiddenTargets[displayTargetKey(kind, target)]
+	s.displayMu.RUnlock()
+	return ok
+}
+
+func (s *appState) removeDisplayedTarget(kind, target string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	filtered := s.messages[:0]
+	for _, msg := range s.messages {
+		if chatType(msg.Wechat) == kind && targetID(msg.Wechat) == target {
+			continue
+		}
+		filtered = append(filtered, msg)
+	}
+	s.messages = filtered
+}
+
+func (s *appState) hiddenTargetList() []hiddenTarget {
+	s.displayMu.RLock()
+	defer s.displayMu.RUnlock()
+
+	targets := make([]hiddenTarget, 0, len(s.hiddenTargets))
+	for _, target := range s.hiddenTargets {
+		targets = append(targets, target)
+	}
+	sort.Slice(targets, func(i, j int) bool {
+		if targets[i].Kind != targets[j].Kind {
+			return targets[i].Kind < targets[j].Kind
+		}
+		return targets[i].ID < targets[j].ID
+	})
+	return targets
+}
+
+func displayTargetKey(kind, target string) string {
+	return normalizeChatKind(kind) + ":" + strings.TrimSpace(target)
+}
+
+func normalizeChatKind(kind string) string {
+	if strings.TrimSpace(kind) == "group" {
+		return "group"
+	}
+	return "private"
 }
 
 func (s *appState) applyRepeatRule(cfg appConfig, msg wechatMessage) error {
@@ -869,9 +983,12 @@ const indexHTML = `<!doctype html>
       border-top: 1px solid var(--line);
       padding: 12px 16px;
       display: grid;
-      grid-template-columns: minmax(0, 1fr) auto;
+      grid-template-columns: minmax(0, 1fr) auto auto;
       gap: 10px;
       background: #fbfcfd;
+    }
+    .hide-form {
+      align-self: start;
     }
     textarea {
       width: 100%;
@@ -897,6 +1014,16 @@ const indexHTML = `<!doctype html>
       cursor: pointer;
     }
     button:hover { background: var(--accent-dark); }
+    button.secondary {
+      color: var(--muted);
+      border: 1px solid var(--line);
+      background: #fff;
+    }
+    button.secondary:hover {
+      color: #fff;
+      border-color: var(--warn);
+      background: var(--warn);
+    }
     .hint {
       grid-column: 1 / -1;
       color: var(--muted);
@@ -908,6 +1035,7 @@ const indexHTML = `<!doctype html>
       .rule-form { grid-template-columns: 1fr; }
       .time { white-space: normal; }
       form.reply { grid-template-columns: 1fr; }
+      .hide-form { width: 100%; }
       button { width: 100%; }
     }
   </style>
@@ -943,6 +1071,26 @@ const indexHTML = `<!doctype html>
         {{end}}
       </div>
       <div class="hint">同一个监听群里，连续两个不同微信ID发送相同文字时，自动向该群发送一次相同文字；同一段连续重复只触发一次。</div>
+    </section>
+    <section class="rule-panel">
+      <h2 class="rule-title">已关闭显示</h2>
+      <div class="rule-row">
+        {{if .HiddenTargets}}
+          {{range .HiddenTargets}}
+            <span class="badge">
+              {{if eq .Kind "group"}}群ID{{else}}微信ID{{end}}：{{.ID}}
+              <form class="inline-form" method="post" action="/display-targets">
+                <input type="hidden" name="action" value="show">
+                <input type="hidden" name="chat_type" value="{{.Kind}}">
+                <input type="hidden" name="target" value="{{.ID}}">
+                <button class="remove-btn" type="submit">恢复显示</button>
+              </form>
+            </span>
+          {{end}}
+        {{else}}
+          <span class="badge">没有关闭任何消息来源</span>
+        {{end}}
+      </div>
     </section>
     {{if not .Messages}}
       <div class="empty">还没有收到消息</div>
@@ -997,7 +1145,12 @@ const indexHTML = `<!doctype html>
           <input type="hidden" name="chat_type" value="{{chatType .Wechat}}">
           <textarea name="text" placeholder="输入回复内容"></textarea>
           <button type="submit">回复</button>
+          <button class="secondary" type="submit" form="hide-{{.ID}}">关闭显示</button>
           <div class="hint">回复目标：{{targetID .Wechat}}</div>
+        </form>
+        <form id="hide-{{.ID}}" class="hide-form" method="post" action="/display-targets">
+          <input type="hidden" name="target" value="{{targetID .Wechat}}">
+          <input type="hidden" name="chat_type" value="{{chatType .Wechat}}">
         </form>
       </article>
     {{end}}
