@@ -14,6 +14,7 @@ import (
 // BuildReplyMsgProto 构建发送回复消息的protobuf并返回hex编码的字符串
 func BuildReplyMsgProto(sender, receiver string, replyInfo *ReplyInfo) (string, error) {
 	now := time.Now().Unix()
+	replyInfo.FromUser = sender
 
 	// 构建appmsg XML
 	appmsgXml := buildReplyAppmsgXml(replyInfo)
@@ -56,7 +57,7 @@ func BuildReplyMsgProto(sender, receiver string, replyInfo *ReplyInfo) (string, 
 			Receiver:      &sender,
 			MsgType:       &msgType,
 			Content:       []byte(appmsgXml),
-			SendTimestamp:  proto.Int64(now),
+			SendTimestamp: proto.Int64(now),
 			ClientMsgId:   &clientMsgId,
 			Unknown9:      &unknown9,
 			Flag:          &flag,
@@ -88,6 +89,7 @@ type ReplyInfo struct {
 	Msgsource   string // 被回复消息的msgsource
 	DisplayName string // 被回复消息发送者的昵称
 	MsgContent  string // 被回复消息的内容
+	FromUser    string // 当前发送者wxid
 }
 
 // buildReplyAppmsgXml 构建回复消息的appmsg XML，字段顺序匹配微信真实protobuf
@@ -135,7 +137,7 @@ func buildReplyAppmsgXml(info *ReplyInfo) string {
 	xml += `</refermsg>`
 	xml += `</appmsg>`
 
-	xml += `<fromusername>` + escapeXmlStr(info.MsgSender) + `</fromusername>`
+	xml += `<fromusername>` + escapeXmlStr(info.FromUser) + `</fromusername>`
 
 	return xml
 }
