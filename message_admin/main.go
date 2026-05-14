@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/xml"
 	"flag"
@@ -236,6 +237,7 @@ func main() {
 	mux.HandleFunc("/api/messages", state.handleMessages)
 	mux.HandleFunc("/events", state.handleEvents)
 	mux.HandleFunc("/reply", state.handleReply(cfg))
+	mux.HandleFunc("/send-image", state.handleSendImage(cfg))
 	mux.HandleFunc("/repeat-groups", state.handleRepeatGroups)
 	mux.HandleFunc("/display-targets", state.handleDisplayTargets)
 	mux.HandleFunc("/group-names", state.handleGroupNames)
@@ -406,7 +408,6 @@ func (s *appState) handleReply(cfg appConfig) http.HandlerFunc {
 		target := strings.TrimSpace(r.FormValue("target"))
 		chatType := strings.TrimSpace(r.FormValue("chat_type"))
 		text := strings.TrimSpace(r.FormValue("text"))
-		mode := strings.TrimSpace(r.FormValue("mode"))
 		if target == "" || text == "" {
 			http.Error(w, "target and text are required", http.StatusBadRequest)
 			return
@@ -415,20 +416,6 @@ func (s *appState) handleReply(cfg appConfig) http.HandlerFunc {
 		msg := sendMessage{
 			Type: "text",
 			Data: map[string]any{"text": text},
-		}
-		if mode == "quote" {
-			replyMessage, err := parseReplyMessage(r.FormValue("reply_message"))
-			if err != nil {
-				http.Error(w, "invalid reply_message: "+err.Error(), http.StatusBadRequest)
-				return
-			}
-			msg = sendMessage{
-				Type: "reply",
-				Data: map[string]any{
-					"text":          text,
-					"reply_message": replyMessage,
-				},
-			}
 		}
 
 		req := sendRequest{Message: []sendMessage{msg}}
@@ -449,25 +436,68 @@ func (s *appState) handleReply(cfg appConfig) http.HandlerFunc {
 	}
 }
 
-func parseReplyMessage(raw string) (wechatMessage, error) {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return wechatMessage{}, fmt.Errorf("empty")
+func (s *appState) handleSendImage(cfg appConfig) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if err := r.ParseMultipartForm(16 << 20); err != nil {
+			http.Error(w, "invalid multipart form: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		target := strings.TrimSpace(r.FormValue("target"))
+		chatType := strings.TrimSpace(r.FormValue("chat_type"))
+		if target == "" {
+			http.Error(w, "target is required", http.StatusBadRequest)
+			return
+		}
+
+		file, header, err := r.FormFile("image")
+		if err != nil {
+			http.Error(w, "image is required: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		defer file.Close()
+
+		if header != nil && header.Size > 10<<20 {
+			http.Error(w, "image too large, max 10MB", http.StatusBadRequest)
+			return
+		}
+		data, err := io.ReadAll(io.LimitReader(file, 10<<20+1))
+		if err != nil {
+			http.Error(w, "read image failed: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		if len(data) == 0 {
+			http.Error(w, "image is empty", http.StatusBadRequest)
+			return
+		}
+		if len(data) > 10<<20 {
+			http.Error(w, "image too large, max 10MB", http.StatusBadRequest)
+			return
+		}
+
+		req := sendRequest{Message: []sendMessage{{
+			Type: "image",
+			Data: map[string]any{"file": base64.StdEncoding.EncodeToString(data)},
+		}}}
+		endpoint := "/send_private_msg"
+		if chatType == "group" {
+			req.GroupID = target
+			endpoint = "/send_group_msg"
+		} else {
+			req.UserID = target
+		}
+
+		if err := postOnebot(cfg.onebotBase, endpoint, req); err != nil {
+			http.Error(w, "send image failed: "+err.Error(), http.StatusBadGateway)
+			return
+		}
+
+		http.Redirect(w, r, "/", http.StatusSeeOther)
 	}
-	var msg wechatMessage
-	if err := json.Unmarshal([]byte(raw), &msg); err != nil {
-		return wechatMessage{}, err
-	}
-	if msg.MessageID == "" {
-		return wechatMessage{}, fmt.Errorf("missing message_id")
-	}
-	if msg.UserID == "" {
-		return wechatMessage{}, fmt.Errorf("missing user_id")
-	}
-	if len(msg.Message) == 0 {
-		return wechatMessage{}, fmt.Errorf("missing message")
-	}
-	return msg, nil
 }
 
 func (s *appState) handleRepeatGroups(w http.ResponseWriter, r *http.Request) {
@@ -1612,13 +1642,28 @@ const indexHTML = `<!doctype html>
       white-space: pre-wrap;
       word-break: break-word;
     }
-    form.reply {
+    .actions {
       border-top: 1px solid var(--line);
       padding: 12px 16px;
       display: grid;
-      grid-template-columns: minmax(0, 1fr) auto auto auto;
-      gap: 10px;
+      gap: 12px;
       background: #fbfcfd;
+    }
+    form.reply,
+    form.image-reply {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 10px;
+      align-items: start;
+    }
+    .image-input {
+      min-height: 42px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 8px 10px;
+      background: #fff;
+      color: var(--muted);
+      font: inherit;
     }
     .hide-form {
       align-self: start;
@@ -1704,7 +1749,7 @@ const indexHTML = `<!doctype html>
       .msg-head { grid-template-columns: 1fr; }
       .rule-form { grid-template-columns: 1fr; }
       .time { white-space: normal; }
-      form.reply { grid-template-columns: 1fr; }
+      form.reply, form.image-reply { grid-template-columns: 1fr; }
       .hide-form { width: 100%; }
       button { width: 100%; }
     }
@@ -1834,16 +1879,22 @@ const indexHTML = `<!doctype html>
             <pre>{{.RawJSON}}</pre>
           </details>
         </div>
-        <form class="reply" method="post" action="/reply">
-          <input type="hidden" name="target" value="{{targetID .Wechat}}">
-          <input type="hidden" name="chat_type" value="{{chatType .Wechat}}">
-          <input type="hidden" name="reply_message" value="{{.RawJSON}}">
-          <textarea name="text" placeholder="输入回复内容"></textarea>
-          <button type="submit" name="mode" value="normal">回复</button>
-          <button class="secondary" type="submit" name="mode" value="quote">引用回复</button>
+        <div class="actions">
+          <form class="reply" method="post" action="/reply">
+            <input type="hidden" name="target" value="{{targetID .Wechat}}">
+            <input type="hidden" name="chat_type" value="{{chatType .Wechat}}">
+            <textarea name="text" placeholder="输入回复内容"></textarea>
+            <button type="submit">回复</button>
+            <div class="hint">回复目标：{{targetID .Wechat}}</div>
+          </form>
+          <form class="image-reply" method="post" action="/send-image" enctype="multipart/form-data">
+            <input type="hidden" name="target" value="{{targetID .Wechat}}">
+            <input type="hidden" name="chat_type" value="{{chatType .Wechat}}">
+            <input class="image-input" type="file" name="image" accept="image/*" required>
+            <button type="submit">发送图片</button>
+          </form>
           <button class="secondary" type="submit" form="hide-{{.ID}}">关闭显示</button>
-          <div class="hint">回复目标：{{targetID .Wechat}}</div>
-        </form>
+        </div>
         <form id="hide-{{.ID}}" class="hide-form" method="post" action="/display-targets">
           <input type="hidden" name="target" value="{{targetID .Wechat}}">
           <input type="hidden" name="chat_type" value="{{chatType .Wechat}}">
