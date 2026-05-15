@@ -248,6 +248,7 @@ func main() {
 	mux.HandleFunc("/", state.handleIndex(cfg))
 	mux.HandleFunc("/onebot", state.handleOnebot(cfg))
 	mux.HandleFunc("/api/messages", state.handleMessages)
+	mux.HandleFunc("/api/v1/ai/message/process", handleAIMessageProcess(newDefaultProfileStore(), ruleBasedMessageAIProcessor{}))
 	mux.HandleFunc("/events", state.handleEvents)
 	mux.HandleFunc("/reply", state.handleReply(cfg))
 	mux.HandleFunc("/send-image", state.handleSendImage(cfg))

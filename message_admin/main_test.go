@@ -1,6 +1,12 @@
 package main
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -211,4 +217,131 @@ func TestApplyRepeatRuleSkipsSensitiveWords(t *testing.T) {
 	if sent != 0 {
 		t.Fatalf("sent sensitive repeat = %d", sent)
 	}
+}
+
+func TestAIMessageProcessTechSupportProfile(t *testing.T) {
+	resp := postAIMessageProcess(t, `{
+		"tenant_id": "default",
+		"channel": "wechat",
+		"external_user_id": "wx_xxx",
+		"conversation_key": "wx_xxx",
+		"message_id": "msg_001",
+		"profile_id": "tech_support_v1",
+		"content": "你好，设备连不上怎么办？",
+		"metadata": {"nickname": "辛巴"}
+	}`)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", resp.Code, resp.Body.String())
+	}
+
+	var got processMessageResponse
+	if err := json.Unmarshal(resp.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !got.OK {
+		t.Fatalf("ok = false body=%s", resp.Body.String())
+	}
+	if got.ProfileID != "tech_support_v1" {
+		t.Fatalf("profile_id = %q", got.ProfileID)
+	}
+	if got.RequestID == "" {
+		t.Fatal("request_id is empty")
+	}
+	if !strings.Contains(got.ReplyText, "最可能原因") || !strings.Contains(got.ReplyText, "设备连不上") {
+		t.Fatalf("unexpected reply_text: %s", got.ReplyText)
+	}
+}
+
+func TestAIMessageProcessDefaultsProfile(t *testing.T) {
+	resp := postAIMessageProcess(t, `{
+		"external_user_id": "wx_xxx",
+		"content": "帮我看一下这个问题"
+	}`)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", resp.Code, resp.Body.String())
+	}
+
+	var got processMessageResponse
+	if err := json.Unmarshal(resp.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got.ProfileID != "default_v1" {
+		t.Fatalf("profile_id = %q", got.ProfileID)
+	}
+	if got.TenantID != "default" || got.Channel != "api" {
+		t.Fatalf("defaults tenant/channel = %q/%q", got.TenantID, got.Channel)
+	}
+	if got.ConversationKey != "wx_xxx" {
+		t.Fatalf("conversation_key = %q", got.ConversationKey)
+	}
+}
+
+func TestAIMessageProcessContentRequired(t *testing.T) {
+	resp := postAIMessageProcess(t, `{"external_user_id":"wx_xxx","content":" "}`)
+	assertAPIError(t, resp, http.StatusBadRequest, "content is required")
+}
+
+func TestAIMessageProcessExternalUserIDRequired(t *testing.T) {
+	resp := postAIMessageProcess(t, `{"content":"你好"}`)
+	assertAPIError(t, resp, http.StatusBadRequest, "external_user_id is required")
+}
+
+func TestAIMessageProcessUnknownProfile(t *testing.T) {
+	resp := postAIMessageProcess(t, `{
+		"external_user_id": "wx_xxx",
+		"profile_id": "missing_v1",
+		"content": "你好"
+	}`)
+	assertAPIError(t, resp, http.StatusBadRequest, "profile_id not found")
+}
+
+func TestAIMessageProcessInvalidJSON(t *testing.T) {
+	resp := postAIMessageProcess(t, `{"external_user_id":`)
+	assertAPIError(t, resp, http.StatusBadRequest, "invalid json")
+}
+
+func TestAIMessageProcessProcessorError(t *testing.T) {
+	handler := handleAIMessageProcess(newDefaultProfileStore(), failingMessageAIProcessor{})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/ai/message/process", bytes.NewBufferString(`{
+		"external_user_id": "wx_xxx",
+		"content": "你好"
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+
+	assertAPIError(t, resp, http.StatusInternalServerError, "processor failed")
+}
+
+func postAIMessageProcess(t *testing.T, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	handler := handleAIMessageProcess(newDefaultProfileStore(), ruleBasedMessageAIProcessor{})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/ai/message/process", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+	return resp
+}
+
+func assertAPIError(t *testing.T, resp *httptest.ResponseRecorder, status int, message string) {
+	t.Helper()
+	if resp.Code != status {
+		t.Fatalf("status = %d body=%s", resp.Code, resp.Body.String())
+	}
+	var got map[string]any
+	if err := json.Unmarshal(resp.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode error response: %v", err)
+	}
+	if got["ok"] != false {
+		t.Fatalf("ok = %v body=%s", got["ok"], resp.Body.String())
+	}
+	if got["error"] != message {
+		t.Fatalf("error = %v, want %q", got["error"], message)
+	}
+}
+
+type failingMessageAIProcessor struct{}
+
+func (failingMessageAIProcessor) Process(context.Context, ProcessMessageRequest, AIProfile) (ProcessMessageResult, error) {
+	return ProcessMessageResult{}, errors.New("boom")
 }
