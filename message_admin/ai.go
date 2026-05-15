@@ -83,6 +83,29 @@ type MessageAIProcessor interface {
 	Process(ctx context.Context, req ProcessMessageRequest, profile AIProfile) (ProcessMessageResult, error)
 }
 
+type AIProcessorConfig struct {
+	Provider      string
+	OpenAIAPIKey  string
+	OpenAIModel   string
+	OpenAIBaseURL string
+	HTTPClient    *http.Client
+}
+
+func NewMessageAIProcessorFromConfig(cfg AIProcessorConfig) MessageAIProcessor {
+	switch strings.ToLower(strings.TrimSpace(cfg.Provider)) {
+	case "", "mock", "rule_based", "rule-based":
+		return NewRuleBasedProcessor()
+	case "openai":
+		return NewOpenAIProcessor(cfg)
+	default:
+		return unsupportedAIProviderProcessor{provider: cfg.Provider}
+	}
+}
+
+func NewRuleBasedProcessor() MessageAIProcessor {
+	return ruleBasedMessageAIProcessor{}
+}
+
 type ruleBasedMessageAIProcessor struct{}
 
 func (p ruleBasedMessageAIProcessor) Process(_ context.Context, req ProcessMessageRequest, profile AIProfile) (ProcessMessageResult, error) {
@@ -106,6 +129,14 @@ func (p ruleBasedMessageAIProcessor) Process(_ context.Context, req ProcessMessa
 		reply += " 当前内容较短，可能需要人工进一步确认。"
 	}
 	return ProcessMessageResult{ReplyText: reply, NeedHuman: needHuman, Status: "processed"}, nil
+}
+
+type unsupportedAIProviderProcessor struct {
+	provider string
+}
+
+func (p unsupportedAIProviderProcessor) Process(context.Context, ProcessMessageRequest, AIProfile) (ProcessMessageResult, error) {
+	return ProcessMessageResult{}, fmt.Errorf("unsupported ai provider: %s", strings.TrimSpace(p.provider))
 }
 
 type processMessageResponse struct {
@@ -156,7 +187,7 @@ func handleAIMessageProcess(store ProfileStore, processor MessageAIProcessor) ht
 		result, err := processor.Process(r.Context(), req, profile)
 		if err != nil {
 			log.Printf("ai message process failed request_id=%s profile_id=%s channel=%s external_user_id=%s err=%v", requestID, req.ProfileID, req.Channel, req.ExternalUserID, err)
-			writeAPIError(w, http.StatusInternalServerError, "processor failed")
+			writeAPIError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 

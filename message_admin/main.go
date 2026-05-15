@@ -126,11 +126,15 @@ type persistedState struct {
 }
 
 type appConfig struct {
-	listenAddr   string
-	onebotBase   string
-	maxMessages  int
-	staticPrefix string
-	statePath    string
+	listenAddr    string
+	onebotBase    string
+	maxMessages   int
+	staticPrefix  string
+	statePath     string
+	aiProvider    string
+	openAIAPIKey  string
+	openAIModel   string
+	openAIBaseURL string
 }
 
 type imageXML struct {
@@ -228,6 +232,10 @@ func main() {
 	flag.StringVar(&cfg.staticPrefix, "static_prefix", "/file/", "本地 file:// 媒体代理路径前缀")
 	flag.StringVar(&cfg.statePath, "state", "state.json", "监听群和显示过滤配置保存文件")
 	flag.StringVar(&repeatGroups, "repeat_groups", "", "启用连续重复内容自动跟发的群ID，多个用逗号分隔")
+	flag.StringVar(&cfg.aiProvider, "ai-provider", firstNonEmpty(os.Getenv("AI_PROVIDER"), "mock"), "AI Provider: mock 或 openai")
+	flag.StringVar(&cfg.openAIAPIKey, "openai-api-key", os.Getenv("OPENAI_API_KEY"), "OpenAI API Key，仅 ai-provider=openai 时使用")
+	flag.StringVar(&cfg.openAIModel, "openai-model", firstNonEmpty(os.Getenv("OPENAI_MODEL"), defaultOpenAIModel), "OpenAI Responses API 模型")
+	flag.StringVar(&cfg.openAIBaseURL, "openai-base-url", os.Getenv("OPENAI_BASE_URL"), "OpenAI API Base URL，可选")
 	flag.Parse()
 
 	state := &appState{
@@ -244,11 +252,17 @@ func main() {
 	if err := state.loadState(); err != nil {
 		log.Printf("load state failed path=%s err=%v", cfg.statePath, err)
 	}
+	aiProcessor := NewMessageAIProcessorFromConfig(AIProcessorConfig{
+		Provider:      cfg.aiProvider,
+		OpenAIAPIKey:  cfg.openAIAPIKey,
+		OpenAIModel:   cfg.openAIModel,
+		OpenAIBaseURL: cfg.openAIBaseURL,
+	})
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", state.handleIndex(cfg))
 	mux.HandleFunc("/onebot", state.handleOnebot(cfg))
 	mux.HandleFunc("/api/messages", state.handleMessages)
-	mux.HandleFunc("/api/v1/ai/message/process", handleAIMessageProcess(newDefaultProfileStore(), ruleBasedMessageAIProcessor{}))
+	mux.HandleFunc("/api/v1/ai/message/process", handleAIMessageProcess(newDefaultProfileStore(), aiProcessor))
 	mux.HandleFunc("/events", state.handleEvents)
 	mux.HandleFunc("/reply", state.handleReply(cfg))
 	mux.HandleFunc("/send-image", state.handleSendImage(cfg))

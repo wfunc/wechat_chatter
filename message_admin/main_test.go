@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -310,7 +311,148 @@ func TestAIMessageProcessProcessorError(t *testing.T) {
 	resp := httptest.NewRecorder()
 	handler.ServeHTTP(resp, req)
 
-	assertAPIError(t, resp, http.StatusInternalServerError, "processor failed")
+	assertAPIError(t, resp, http.StatusInternalServerError, "boom")
+}
+
+func TestNewMessageAIProcessorFromConfigDefaultsToMock(t *testing.T) {
+	processor := NewMessageAIProcessorFromConfig(AIProcessorConfig{})
+	result, err := processor.Process(context.Background(), ProcessMessageRequest{
+		Content: "你好，帮我看一下",
+	}, AIProfile{ID: "default_v1"})
+	if err != nil {
+		t.Fatalf("Process error = %v", err)
+	}
+	if result.ReplyText == "" || result.Status != "processed" {
+		t.Fatalf("unexpected result: %+v", result)
+	}
+}
+
+func TestOpenAIProcessorMissingAPIKey(t *testing.T) {
+	processor := NewMessageAIProcessorFromConfig(AIProcessorConfig{Provider: "openai"})
+	_, err := processor.Process(context.Background(), ProcessMessageRequest{Content: "你好"}, AIProfile{ID: "default_v1"})
+	if err == nil || !strings.Contains(err.Error(), "openai api key is required") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestUnsupportedAIProvider(t *testing.T) {
+	processor := NewMessageAIProcessorFromConfig(AIProcessorConfig{Provider: "unknown"})
+	_, err := processor.Process(context.Background(), ProcessMessageRequest{Content: "你好"}, AIProfile{ID: "default_v1"})
+	if err == nil || !strings.Contains(err.Error(), "unsupported ai provider: unknown") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestExtractOpenAIResponseTextOutputText(t *testing.T) {
+	got, err := extractOpenAIResponseText([]byte(`{"output_text":"你好，这是回复"}`))
+	if err != nil {
+		t.Fatalf("extractOpenAIResponseText error = %v", err)
+	}
+	if got != "你好，这是回复" {
+		t.Fatalf("text = %q", got)
+	}
+}
+
+func TestExtractOpenAIResponseTextOutputContentText(t *testing.T) {
+	got, err := extractOpenAIResponseText([]byte(`{
+		"output": [
+			{"content": [{"type": "output_text", "text": "从 content 里解析"}]}
+		]
+	}`))
+	if err != nil {
+		t.Fatalf("extractOpenAIResponseText error = %v", err)
+	}
+	if got != "从 content 里解析" {
+		t.Fatalf("text = %q", got)
+	}
+}
+
+func TestExtractOpenAIResponseTextEmpty(t *testing.T) {
+	_, err := extractOpenAIResponseText([]byte(`{"output":[]}`))
+	if err == nil || !strings.Contains(err.Error(), "openai response has no text") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestOpenAIProcessorWithHTTPTestServer(t *testing.T) {
+	var gotAuth string
+	var gotPayload openAIResponsesRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/responses" {
+			t.Fatalf("path = %s", r.URL.Path)
+		}
+		gotAuth = r.Header.Get("Authorization")
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		if err := json.Unmarshal(body, &gotPayload); err != nil {
+			t.Fatalf("decode payload: %v", err)
+		}
+		_, _ = w.Write([]byte(`{"output_text":"OpenAI 测试回复"}`))
+	}))
+	defer server.Close()
+
+	processor := NewMessageAIProcessorFromConfig(AIProcessorConfig{
+		Provider:      "openai",
+		OpenAIAPIKey:  "test-key",
+		OpenAIModel:   "test-model",
+		OpenAIBaseURL: server.URL,
+	})
+	result, err := processor.Process(context.Background(), ProcessMessageRequest{
+		TenantID:        "default",
+		Channel:         "wechat",
+		ExternalUserID:  "wx_xxx",
+		ConversationKey: "wx_xxx",
+		ProfileID:       "tech_support_v1",
+		Content:         "设备连不上",
+		Metadata:        map[string]any{"nickname": "辛巴", "unsafe": map[string]any{"x": "y"}},
+	}, AIProfile{
+		ID:    "tech_support_v1",
+		Name:  "技术支持助手",
+		Style: "直接",
+		Rules: []string{"先给最可能原因"},
+	})
+	if err != nil {
+		t.Fatalf("Process error = %v", err)
+	}
+	if result.ReplyText != "OpenAI 测试回复" {
+		t.Fatalf("reply_text = %q", result.ReplyText)
+	}
+	if gotAuth != "Bearer test-key" {
+		t.Fatalf("authorization = %q", gotAuth)
+	}
+	if gotPayload.Model != "test-model" || gotPayload.Input != "设备连不上" {
+		t.Fatalf("payload = %+v", gotPayload)
+	}
+	if gotPayload.Metadata["nickname"] != "辛巴" {
+		t.Fatalf("nickname metadata = %q", gotPayload.Metadata["nickname"])
+	}
+	if _, ok := gotPayload.Metadata["unsafe"]; ok {
+		t.Fatalf("unsafe metadata leaked: %+v", gotPayload.Metadata)
+	}
+	if strings.Contains(result.ReplyText, "先给最可能原因") {
+		t.Fatalf("profile rules leaked into reply: %s", result.ReplyText)
+	}
+}
+
+func TestOpenAIProcessorNon2xx(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "bad request", http.StatusBadRequest)
+	}))
+	defer server.Close()
+
+	processor := NewMessageAIProcessorFromConfig(AIProcessorConfig{
+		Provider:      "openai",
+		OpenAIAPIKey:  "test-key",
+		OpenAIBaseURL: server.URL,
+	})
+	_, err := processor.Process(context.Background(), ProcessMessageRequest{
+		Content: "你好",
+	}, AIProfile{ID: "default_v1"})
+	if err == nil || !strings.Contains(err.Error(), "openai responses api returned 400 Bad Request") {
+		t.Fatalf("error = %v", err)
+	}
 }
 
 func postAIMessageProcess(t *testing.T, body string) *httptest.ResponseRecorder {
